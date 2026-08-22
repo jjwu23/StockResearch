@@ -114,6 +114,20 @@ def filing_metrics(symbol: str) -> dict[str, Any]:
     operating = fact_series(bundle, ["OperatingIncomeLoss"])
     cfo = fact_series(bundle, ["NetCashProvidedByUsedInOperatingActivities"])
     result = {"cik": bundle.get("cik"), "name": bundle.get("name", symbol), "revenue": revenue, "eps": eps, "net": net, "gross": gross, "operating": operating, "cfo": cfo}
+    result.update({
+        "cogs": fact_series(bundle, ["CostOfRevenue", "CostOfGoodsAndServicesSold"]),
+        "rd": fact_series(bundle, ["ResearchAndDevelopmentExpense"]),
+        "ga": fact_series(bundle, ["SellingGeneralAndAdministrativeExpense"]),
+        "opex": fact_series(bundle, ["OperatingExpenses"]),
+        "interest": fact_series(bundle, ["InterestIncomeExpenseNonOperatingNet", "InterestExpenseNonOperating"]),
+        "pretax": fact_series(bundle, ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"]),
+        "taxes": fact_series(bundle, ["IncomeTaxExpenseBenefit"]),
+        "shares": fact_series(bundle, ["WeightedAverageNumberOfDilutedSharesOutstanding", "EntityCommonStockSharesOutstanding"], "shares"),
+        "assets": fact_series(bundle, ["Assets"]),
+        "liabilities": fact_series(bundle, ["Liabilities"]),
+        "equity": fact_series(bundle, ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]),
+        "capex": fact_series(bundle, ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"]),
+    })
     result["revenue_yoy"] = latest_yoy(revenue)
     result["eps_yoy"] = latest_yoy(eps)
     result["fcf_yoy"] = latest_yoy(cfo)
@@ -129,7 +143,7 @@ def enrichment(symbol: str) -> dict[str, Any]:
     try:
         ticker = yf.Ticker(symbol)
         raw = ticker.info
-        info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": raw.get("recommendationKey"), "sector": raw.get("sector"), "industry": raw.get("industry"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary")})
+        info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": raw.get("recommendationKey"), "sector": raw.get("sector"), "industry": raw.get("industry"), "gics_industry": raw.get("industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None})
         rec = ticker.recommendations
         info["buy_share"] = ((rec["strongBuy"] + rec["buy"]).tail(4).sum() / rec.tail(4)[["strongBuy", "buy", "hold", "sell", "strongSell"]].sum().sum() * 100) if rec is not None and not rec.empty and "strongBuy" in rec else None
         ins = ticker.insider_transactions
@@ -192,7 +206,71 @@ def chart(symbol: str, frame: pd.DataFrame, direction: str, insider_value: Any) 
 
 def financial_table(metrics: dict[str, Any]) -> pd.DataFrame:
     series = {"Revenue": metrics.get("revenue"), "Net income": metrics.get("net"), "Operating income": metrics.get("operating"), "EPS": metrics.get("eps"), "Cash flow from operations": metrics.get("cfo")}
-    return pd.DataFrame({k: s for k, s in series.items() if isinstance(s, pd.Series)}).tail(20).sort_index(ascending=False)
+    return pd.DataFrame({k: s for k, s in series.items() if isinstance(s, pd.Series)}).tail(20).sort_index()
+
+
+STATEMENT_LINES = [
+    ("Income statement", "Revenue", "revenue"), ("Income statement", "COGS", "cogs"),
+    ("Income statement", "Gross Profit", "gross"), ("Income statement", "Gross Margin %", "gross_margin_series"),
+    ("Income statement", "R&D", "rd"), ("Income statement", "G&A", "ga"),
+    ("Income statement", "Total Operating Expenses", "opex"), ("Income statement", "Operating Income", "operating"),
+    ("Income statement", "Operating Margin %", "operating_margin_series"), ("Income statement", "Interest Income", "interest"),
+    ("Income statement", "Pretax Income", "pretax"), ("Income statement", "Taxes", "taxes"),
+    ("Income statement", "Net Income", "net"), ("Income statement", "EPS", "eps"), ("Income statement", "Shares", "shares"),
+    ("Balance sheet", "Total Assets", "assets"), ("Balance sheet", "Total Liabilities", "liabilities"),
+    ("Balance sheet", "Stockholders' Equity", "equity"), ("Statement of cash flow", "Cash Flow from Operations", "cfo"),
+    ("Statement of cash flow", "Capital Expenditures", "capex"), ("Statement of cash flow", "Free Cash Flow", "fcf"),
+]
+
+
+def statement_frame(metrics: dict[str, Any], annual: bool = True) -> pd.DataFrame:
+    """Build a date-across statement with a YoY row after every financial line."""
+    derived = dict(metrics)
+    revenue = metrics.get("revenue", pd.Series(dtype=float))
+    if isinstance(revenue, pd.Series) and not revenue.empty:
+        for key, numerator in [("gross_margin_series", metrics.get("gross")), ("operating_margin_series", metrics.get("operating"))]:
+            if isinstance(numerator, pd.Series):
+                derived[key] = numerator.divide(revenue.reindex(numerator.index), fill_value=np.nan) * 100
+    for key in ["assets", "liabilities", "equity", "capex"]:
+        derived.setdefault(key, pd.Series(dtype=float))
+    if isinstance(derived.get("cfo"), pd.Series) and isinstance(derived.get("capex"), pd.Series):
+        derived["fcf"] = derived["cfo"].sub(derived["capex"], fill_value=0)
+    grouped: dict[str, pd.Series] = {}
+    for _, label, key in STATEMENT_LINES:
+        series = derived.get(key)
+        if not isinstance(series, pd.Series) or series.empty: continue
+        series = series[~series.index.duplicated(keep="last")].sort_index()
+        grouped[label] = series.groupby(series.index.year).last() if annual else series.groupby(series.index.to_period("Q")).last()
+    if not grouped: return pd.DataFrame()
+    values = pd.DataFrame(grouped).T.reindex(sorted(set().union(*(s.index for s in grouped.values())), key=str), axis=1)
+    output: dict[str, pd.Series] = {}
+    for section, label, _ in STATEMENT_LINES:
+        if label not in values.index: continue
+        line = values.loc[label]
+        output[f"{section} · {label}"] = line
+        output[f"{section} · {label} YoY %"] = line.pct_change(periods=1 if annual else 4) * 100
+    result = pd.DataFrame(output).T
+    result.columns = [str(c) for c in result.columns]
+    return result
+
+
+def peer_metric_frame(symbols: list[str], line: str, annual: bool = True) -> pd.DataFrame:
+    key = next((key for section, label, key in STATEMENT_LINES if label == line), "revenue")
+    rows = {}
+    for symbol in symbols:
+        metrics = filing_metrics(symbol)
+        if key == "gross_margin_series":
+            series = metrics.get("gross").divide(metrics.get("revenue").reindex(metrics.get("gross").index), fill_value=np.nan) * 100 if isinstance(metrics.get("gross"), pd.Series) else pd.Series(dtype=float)
+        elif key == "operating_margin_series":
+            series = metrics.get("operating").divide(metrics.get("revenue").reindex(metrics.get("operating").index), fill_value=np.nan) * 100 if isinstance(metrics.get("operating"), pd.Series) else pd.Series(dtype=float)
+        else:
+            series = metrics.get(key)
+        if isinstance(series, pd.Series) and not series.empty:
+            rows[symbol] = series.groupby(series.index.year).last() if annual else series.groupby(series.index.to_period("Q")).last()
+    if not rows: return pd.DataFrame()
+    frame = pd.DataFrame(rows).T
+    frame["Industry average"] = frame.mean(axis=0)
+    return frame
 
 
 def main() -> None:
@@ -203,66 +281,121 @@ def main() -> None:
         use_demo = st.checkbox("Use compact demo universe", value=True)
         universe = DEFAULT_UNIVERSE if use_demo else listed_universe()
         selected = st.multiselect("Symbols", universe, default=universe[:8])
+        scan_all = st.checkbox("Scan full listed universe", value=False, disabled=use_demo, help="Uses Nasdaq Trader's Nasdaq and other-listed symbol files. This can take time and is rate-limited by data providers.")
         direction = st.radio("Rank", ["Long", "Short"], horizontal=True)
         st.caption("Primary sources: SEC Company Facts and filings. Market/analyst enrichment: Yahoo Finance.")
         st.divider(); st.header("Screen thresholds")
-        thresholds = {"Revenue growth": st.slider("Revenue growth YoY %", -50, 100, 15 if direction == "Long" else -15), "EPS growth": st.slider("EPS growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Earnings beats": st.slider("Earnings beats, past year", 0, 4, 3), "FCF growth": st.slider("FCF growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Margins positive": st.slider("Minimum margin %", -50, 50, 0), "Margins expanding": st.slider("Margin expansion YoY pts", -50, 50, 0), "Buy share trend": st.slider("Buy recommendation change pts", -100, 100, 0), "Target trend": st.slider("Target change YoY %", -100, 200, 0), "Price target gap": st.slider("Price target gap %", -100, 200, 15 if direction == "Long" else -15), "Insider cluster": st.slider("Insider cluster / 90d $", 0, 10_000_000, 0), "Institution net flow": st.slider("Institution net flow $", -10_000_000, 10_000_000, 0)}
-    if not selected:
-        st.info("Choose at least one symbol in the sidebar."); return
+        with st.form("screen_form"):
+            thresholds = {"Revenue growth": st.slider("Revenue growth YoY %", -50, 100, 15 if direction == "Long" else -15), "EPS growth": st.slider("EPS growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Earnings beats": st.slider("Earnings beats, past year", 0, 4, 3), "FCF growth": st.slider("FCF growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Margins positive": st.slider("Operating margin %", -50, 50, 0), "Margins expanding": st.slider("Margin expansion YoY pts", -50, 50, 0), "Buy share trend": st.slider("Buy recommendation change pts", -100, 100, 0), "Target trend": st.slider("Target change YoY %", -100, 200, 0), "Price target gap": st.slider("Price target gap %", -100, 200, 15 if direction == "Long" else -15), "Insider cluster": st.slider("Insider cluster / 90d $", 0, 10_000_000, 0), "Institution net flow": st.slider("Institution net flow $", -10_000_000, 10_000_000, 0)}
+            min_score = st.slider("Minimum score to show", 0, 120, 60, step=10)
+            scan = st.form_submit_button("Scan universe", type="primary", use_container_width=True)
+    if scan:
+        if not selected:
+            st.warning("Choose at least one symbol before scanning.")
+        else:
+            scan_symbols = universe if scan_all else selected
+            with st.spinner(f"Scanning {len(scan_symbols)} symbols…"):
+                st.session_state["screen_records"] = [score_record(symbol, direction, thresholds) for symbol in scan_symbols]
+            st.session_state["screen_config"] = {"direction": direction, "thresholds": thresholds, "min_score": min_score, "selected": scan_symbols}
+    config = st.session_state.get("screen_config")
+    records = st.session_state.get("screen_records", [])
+    if not config or not records:
+        st.info("Choose the universe and thresholds, then click **Scan universe**.")
+        return
+    direction = config["direction"]
+    table = pd.DataFrame(records)
+    filtered_records = [r for r in records if r["Score"] >= config["min_score"]]
+    filtered_table = pd.DataFrame(filtered_records).sort_values("Score", ascending=False) if filtered_records else pd.DataFrame(columns=table.columns)
+    candidate_symbols = [r["Symbol"] for r in filtered_records] or [r["Symbol"] for r in records]
 
     tab1, tab2, tab3, tab4 = st.tabs(["1 · Screener", "2 · Technicals", "3 · Company deep dive", "4 · Daily chart"])
-    with st.spinner("Reading filing and market data…"):
-        records = [score_record(symbol, direction, thresholds) for symbol in selected]
-    table = pd.DataFrame(records).sort_values("Score", ascending=False)
     with tab1:
-        st.subheader(f"Default {direction.lower()} candidates")
-        st.dataframe(table[["Symbol", "Score", "Max", "Price", "Target gap %", "Revenue yoy %", "EPS yoy %", "FCF yoy %", "Margins %", "Insider 90d $", "Recommendation"]], use_container_width=True, hide_index=True)
+        st.subheader(f"Scanned {direction.lower()} candidates")
+        display = filtered_table.copy()
+        if not display.empty:
+            display["GICS Industry"] = display.Symbol.map({r["Symbol"]: r["Extra"].get("gics_industry", "NA") for r in filtered_records})
+            display["Marketplace"] = display.Symbol.map({r["Symbol"]: r["Extra"].get("marketplace", "NA") for r in filtered_records})
+            display["Current Price"] = display["Price"]
+            display["Analyst Consensus"] = display["Recommendation"]
+        columns = ["Symbol", "Score", "Max", "GICS Industry", "Marketplace", "Current Price", "Analyst Consensus", "Target gap %", "Revenue yoy %", "EPS yoy %", "FCF yoy %", "Margins %", "Insider 90d $"]
+        st.dataframe(display[columns] if not display.empty else pd.DataFrame(columns=columns), use_container_width=True, hide_index=True)
+        st.caption(f"{len(filtered_records)} of {len(records)} scanned symbols meet the {config['min_score']}-point minimum. Margins % is operating margin. Each satisfied criterion contributes 10 points; NA data is neutral.")
         st.caption("Each of 12 criteria contributes 10 points. NA data is neutral; inspect source coverage before acting. Earnings surprises, Form 4 clusters, and 13F flow require a filing parser or licensed feed when Yahoo does not expose them.")
         cols = st.columns(3)
         for col, title, keys in zip(cols, ["Fundamentals", "Valuation", "Insider activity"], [["Revenue yoy %", "EPS yoy %", "FCF yoy %", "Margins %"], ["Recommendation", "Target gap %"], ["Insider 90d $"]]):
             with col:
                 st.markdown(f"**{title}**")
                 st.write(", ".join(keys))
-                st.progress(min(float(table.Score.max()) / max(float(table.Max.max()), 1), 1))
+                st.progress(min(float(filtered_table.Score.max()) / max(float(filtered_table.Max.max()), 1), 1) if not filtered_table.empty else 0)
     with tab2:
         st.subheader("Technical confirmation")
         tech_rows = []
-        for row in records:
+        for row in filtered_records or records:
             flags = tech_flags(prices(row["Symbol"], "2y"), direction)
             tech_rows.append({"Symbol": row["Symbol"], "At EMA/support": flags.get("near_level", False), "Trend": flags.get("trend", "NA"), "2× volume": flags.get("high_volume", False), "Level": flags.get("support_resistance")})
         st.dataframe(pd.DataFrame(tech_rows), use_container_width=True, hide_index=True)
         st.caption("Longs seek EMA/support, rising structure, or 2× volume. Shorts invert the level and trend interpretation.")
     with tab3:
-        symbol = st.selectbox("Company", selected, key="deep_company")
+        symbol = st.selectbox("Company", candidate_symbols, key="deep_company")
         row = next(r for r in records if r["Symbol"] == symbol); metrics = row["Metrics"]; extra = row["Extra"]
         st.subheader(f"{symbol} · {extra.get('sector', 'Sector unavailable')}")
         st.write(extra.get("summary") or "Business summary unavailable from the current provider.")
         a, b, c, d = st.columns(4); a.metric("Market cap", fmt(extra.get("market_cap"))); b.metric("Revenue YoY", fmt(metrics.get("revenue_yoy"), "%")); c.metric("Net margin", fmt(metrics.get("net_margin"), "%")); d.metric("SEC CIK", metrics.get("cik") or "NA")
-        st.markdown("**Reported financials (SEC XBRL facts; latest 20 periods)**")
-        st.dataframe(financial_table(metrics), use_container_width=True)
-        if any(isinstance(metrics.get(k), pd.Series) and not metrics[k].empty for k in ["revenue", "net", "operating", "eps", "cfo"]):
-            trend = pd.DataFrame({k: metrics[k] for k in ["revenue", "net", "operating", "eps", "cfo"] if isinstance(metrics.get(k), pd.Series) and not metrics[k].empty})
-            st.line_chart(trend, height=260)
-        peers = [p.strip().upper() for p in st.text_input("Three closest competitors (comma-separated)", value="MSFT, GOOGL, AMZN" if symbol == "AAPL" else "AAPL, MSFT, GOOGL").split(",") if p.strip() and p.strip().upper() != symbol]
-        peer_rows = []
-        for peer in peers[:3]:
-            peer_metrics = filing_metrics(peer); peer_info = enrichment(peer)
-            peer_rows.append({"Company": peer, "Price": peer_info.get("price"), "Market cap": peer_info.get("market_cap"), "Revenue YoY %": peer_metrics.get("revenue_yoy"), "Net margin %": peer_metrics.get("net_margin"), "Industry": peer_info.get("industry", "NA")})
-        if peer_rows:
-            st.markdown("**Peer comparison**")
+        st.markdown("**Reported financials (SEC XBRL facts)**")
+        annual_view = st.radio("Reporting period", ["Annual", "Quarterly"], horizontal=True, key="reporting_period") == "Annual"
+        company_table = statement_frame(metrics, annual=annual_view)
+        st.dataframe(company_table, use_container_width=True)
+        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", value="MSFT, GOOGL, AMZN" if symbol == "AAPL" else "AAPL, MSFT, GOOGL").split(",") if p.strip() and p.strip().upper() != symbol][:3]
+        peer_label = st.selectbox("Comparison table", ["Industry average"] + [f"Peer {i + 1} · {p}" for i, p in enumerate(peers)], key="peer_table")
+        peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1] if peer_label.startswith("Peer") else None
+        if peer_symbol:
+            st.dataframe(statement_frame(filing_metrics(peer_symbol), annual=annual_view), use_container_width=True)
+        else:
+            peer_rows = []
+            for peer in peers:
+                peer_metrics = filing_metrics(peer); peer_info = enrichment(peer)
+                peer_rows.append({"Company": peer, "GICS Industry": peer_info.get("gics_industry", "NA"), "Marketplace": peer_info.get("marketplace", "NA"), "Current Price": peer_info.get("price"), "Revenue YoY %": peer_metrics.get("revenue_yoy"), "Operating margin %": peer_metrics.get("operating_margin")})
             st.dataframe(pd.DataFrame(peer_rows), use_container_width=True, hide_index=True)
-        st.markdown("**DCF / comparables workspace**")
-        assumptions = st.columns(4); revenue_growth = assumptions[0].number_input("Forward revenue growth %", value=12.0); margin = assumptions[1].number_input("Forward operating margin %", value=20.0); wacc = assumptions[2].number_input("WACC %", value=9.0); terminal = assumptions[3].number_input("Terminal growth %", value=3.0)
-        base = float(metrics["revenue"].iloc[-1]) if len(metrics.get("revenue", [])) else 0
-        forecast = pd.DataFrame({"Year": ["Y1", "Y2", "Y3", "Y4", "Y5"], "Revenue": [base * (1 + revenue_growth / 100) ** i for i in range(1, 6)]}); forecast["Operating income"] = forecast.Revenue * margin / 100
-        st.dataframe(forecast, use_container_width=True, hide_index=True)
-        pv = float((forecast["Operating income"] * .75 / (1 + wacc / 100) ** np.arange(1, 6)).sum()) if base else 0
-        st.metric("Illustrative enterprise value from forecast", fmt(pv), "Replace with company-specific debt, cash, shares and terminal value before use")
-        implied = pv / float(extra.get("market_cap")) - 1 if pv and extra.get("market_cap") else None
-        verdict = "Buy" if implied is not None and implied >= .15 else "Sell" if implied is not None and implied <= -.15 else "Hold"
-        st.metric("Illustrative verdict", verdict, f"{implied:.1%} upside/downside vs market cap" if implied is not None else "Needs market cap and complete DCF inputs")
+        available_lines = [label for _, label, _ in STATEMENT_LINES if label in company_table.index and "YoY" not in label]
+        if available_lines:
+            selected_line = st.selectbox("Financial line for peer chart", available_lines, key="financial_line")
+            comparison = peer_metric_frame([symbol] + peers, selected_line, annual=annual_view)
+            if not comparison.empty:
+                latest_column = comparison.columns[-1]
+                chart_values = comparison[latest_column].rename("Latest reported value").to_frame()
+                st.markdown(f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**")
+                st.bar_chart(chart_values)
+        st.markdown("**DCF workspace**")
+        analyst_growth = pct(extra.get("analyst_growth")) or 12.0
+        consensus_target = extra.get("target")
+        assumptions = st.columns(5)
+        revenue_growth = assumptions[0].number_input("Revenue growth %", value=float(analyst_growth), key="dcf_growth")
+        margin = assumptions[1].number_input("Operating margin %", value=float(metrics.get("operating_margin") or 20), key="dcf_margin")
+        wacc = assumptions[2].number_input("WACC %", value=9.0, key="dcf_wacc")
+        terminal = assumptions[3].number_input("Terminal growth %", value=3.0, key="dcf_terminal")
+        shares = assumptions[4].number_input("Shares (mm)", value=float(metrics.get("shares").iloc[-1] / 1_000_000) if isinstance(metrics.get("shares"), pd.Series) and not metrics["shares"].empty else 1.0, key="dcf_shares")
+        st.caption(f"Analyst consensus growth used to prefill: {analyst_growth:.1f}%. Company guidance: {extra.get('guidance') or 'Not available from the current source.'}")
+        base = float(metrics["revenue"].iloc[-1]) if isinstance(metrics.get("revenue"), pd.Series) and not metrics["revenue"].empty else 0
+        years = np.arange(1, 6)
+        forecast = pd.DataFrame({"Year": [f"Y{i}" for i in years]})
+        forecast["Revenue"] = [base * (1 + revenue_growth / 100) ** i for i in years]
+        forecast["COGS"] = forecast.Revenue * (1 - (metrics.get("gross_margin") or 50) / 100)
+        forecast["Gross Profit"] = forecast.Revenue - forecast.COGS
+        forecast["R&D"] = forecast.Revenue * .08; forecast["G&A"] = forecast.Revenue * .10
+        forecast["Total Operating Expenses"] = forecast["R&D"] + forecast["G&A"]
+        forecast["Operating Income"] = forecast.Revenue * margin / 100
+        forecast["Interest Income"] = forecast.Revenue * .005; forecast["Pretax Income"] = forecast["Operating Income"] + forecast["Interest Income"]
+        forecast["Taxes"] = forecast["Pretax Income"] * .21; forecast["Net Income"] = forecast["Pretax Income"] - forecast["Taxes"]
+        forecast["EPS"] = forecast["Net Income"] / max(shares, 1e-9) / 1_000_000
+        st.dataframe(forecast.set_index("Year").T, use_container_width=True)
+        pv_equity = float((forecast["Net Income"] / (1 + wacc / 100) ** years).sum()) if base and shares else 0
+        dcf_price = pv_equity / (shares * 1_000_000) if shares else None
+        current_price = extra.get("price")
+        dcf_upside = dcf_price / current_price - 1 if dcf_price and current_price else None
+        consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
+        m1, m2, m3 = st.columns(3); m1.metric("DCF stock price", fmt(dcf_price), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); m2.metric("Analyst consensus", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); m3.metric("Current price", fmt(current_price))
     with tab4:
-        symbol = st.selectbox("Chart company", selected, key="chart_company"); row = next(r for r in records if r["Symbol"] == symbol); frame = prices(symbol, "2y")
+        symbol = st.selectbox("Chart company", candidate_symbols, key="chart_company"); row = next(r for r in records if r["Symbol"] == symbol); frame = prices(symbol, "2y")
         if frame.empty: st.warning("No daily price history available.")
         else: st.plotly_chart(chart(symbol, frame, direction, row.get("Insider 90d $")), use_container_width=True)
         st.caption("Daily OHLCV from Yahoo Finance. EMA colors: 20-day cyan, 200-day orange, 200-week thick yellow; purple marks the latest available insider activity.")
