@@ -22,6 +22,7 @@ import yfinance as yf
 st.set_page_config(page_title="Equity Signal Lab", page_icon="◒", layout="wide")
 SEC_HEADERS = {"User-Agent": "Equity Signal Lab research app contact@example.com"}
 DEFAULT_UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AVGO", "JPM", "LLY", "TSLA", "AMD", "NFLX"]
+TOP_MARKET_CAP_DEFAULT = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "BRK-B", "LLY"]
 
 
 def pct(value: Any) -> float | None:
@@ -36,6 +37,34 @@ def fmt(value: Any, suffix: str = "") -> str:
     if value is None or pd.isna(value):
         return "NA"
     return f"{value:,.2f}{suffix}"
+
+
+def clenow_momentum(frame: pd.DataFrame, window: int = 90) -> float | None:
+    """Annualized exponential regression slope multiplied by regression R²."""
+    if frame.empty or "Close" not in frame or len(frame) < window:
+        return None
+    close = pd.to_numeric(frame["Close"].tail(window), errors="coerce").dropna()
+    if len(close) < window or (close <= 0).any():
+        return None
+    x = np.arange(len(close), dtype=float)
+    y = np.log(close.to_numpy(dtype=float))
+    slope, intercept = np.polyfit(x, y, 1)
+    fitted = slope * x + intercept
+    ss_res = float(np.square(y - fitted).sum())
+    ss_tot = float(np.square(y - y.mean()).sum())
+    r_squared = 1 - ss_res / ss_tot if ss_tot else 0.0
+    return float(100 * (np.exp(slope * 250) - 1) * max(0.0, r_squared))
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def top_market_cap_universe() -> list[str]:
+    """Rank the default large-cap candidates by the latest available market cap."""
+    rows = []
+    for symbol in TOP_MARKET_CAP_DEFAULT:
+        market_cap = enrichment(symbol).get("market_cap")
+        rows.append((symbol, market_cap or 0))
+    ranked = [symbol for symbol, _ in sorted(rows, key=lambda item: item[1], reverse=True)]
+    return ranked or TOP_MARKET_CAP_DEFAULT
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -140,25 +169,58 @@ def filing_metrics(symbol: str) -> dict[str, Any]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def enrichment(symbol: str) -> dict[str, Any]:
     info: dict[str, Any] = {}
+    ticker = yf.Ticker(symbol)
     try:
-        ticker = yf.Ticker(symbol)
-        raw = ticker.info
-        info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": raw.get("recommendationKey"), "sector": raw.get("sector"), "industry": raw.get("industry"), "gics_industry": raw.get("industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None})
+        raw = ticker.info or {}
+    except Exception:
+        raw = {}
+    info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": raw.get("recommendationKey"), "sector": raw.get("sector"), "industry": raw.get("industry"), "gics_industry": raw.get("industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None, "last_earnings": None, "next_earnings": None})
+    try:
+        quote = prices(symbol, "1mo")
+        # Use the latest completed daily close for the screener snapshot.
+        info["price"] = float(quote["Close"].iloc[-1]) if not quote.empty else info.get("price")
+    except Exception:
+        info["price"] = info.get("price")
+    if not info.get("market_cap") and info.get("price"):
+        try:
+            info["market_cap"] = float(ticker.fast_info.get("market_cap"))
+        except Exception:
+            pass
+    try:
         rec = ticker.recommendations
         info["buy_share"] = ((rec["strongBuy"] + rec["buy"]).tail(4).sum() / rec.tail(4)[["strongBuy", "buy", "hold", "sell", "strongSell"]].sum().sum() * 100) if rec is not None and not rec.empty and "strongBuy" in rec else None
+    except Exception:
+        info["buy_share"] = None
+    try:
+        earnings_dates = pd.to_datetime(ticker.get_earnings_dates(limit=12).index, errors="coerce").tz_localize(None)
+        today = pd.Timestamp.today().normalize()
+        past = earnings_dates[earnings_dates <= today]
+        future = earnings_dates[earnings_dates > today]
+        info["last_earnings"] = past.max().date().isoformat() if len(past) else None
+        info["next_earnings"] = future.min().date().isoformat() if len(future) else None
+    except Exception:
+        pass
+    try:
         ins = ticker.insider_transactions
         if ins is not None and not ins.empty:
-            info["insider_90d"] = float(ins[ins.index >= pd.Timestamp.today() - pd.Timedelta(days=90)].get("Value", pd.Series(dtype=float)).fillna(0).sum())
+            ins = ins.copy()
+            date_col = next((c for c in ["Start Date", "Date", "startDate"] if c in ins.columns), None)
+            dates = pd.to_datetime(ins[date_col] if date_col else ins.index, errors="coerce")
+            values = pd.to_numeric(ins.get("Value", pd.Series(index=ins.index, dtype=float)), errors="coerce").fillna(0)
+            text = ins.astype(str).agg(" ".join, axis=1).str.lower()
+            purchases = text.str.contains("purchase|buy|acquisition", regex=True, na=False)
+            info["insider_90d"] = float(values[(dates >= pd.Timestamp.today() - pd.Timedelta(days=90)) & purchases].sum())
         else:
             info["insider_90d"] = None
     except Exception:
-        pass
+        info["insider_90d"] = None
     return info
 
 
 def score_record(symbol: str, direction: str, thresholds: dict[str, float]) -> dict[str, Any]:
     metrics = filing_metrics(symbol)
     extra = enrichment(symbol)
+    momentum = clenow_momentum(prices(symbol, "1y"))
     price = extra.get("price")
     target = extra.get("target")
     target_gap = (target / price - 1) * 100 if price and target else None
@@ -167,7 +229,7 @@ def score_record(symbol: str, direction: str, thresholds: dict[str, float]) -> d
         "Revenue growth": metrics.get("revenue_yoy"), "EPS growth": metrics.get("eps_yoy"), "Earnings beats": None,
         "FCF growth": metrics.get("fcf_yoy"), "Margins positive": min([x for x in [metrics.get("gross_margin"), metrics.get("operating_margin"), metrics.get("net_margin")] if x is not None], default=None),
         "Margins expanding": None, "Analyst consensus": 1 if extra.get("recommendation") in ({"buy", "strong_buy", "hold"} if is_long else {"hold", "sell", "strong_sell"}) else 0,
-        "Buy share trend": None, "Target trend": None, "Price target gap": target_gap, "Insider cluster": extra.get("insider_90d"), "Institution net flow": None,
+        "Buy share trend": None, "Target trend": None, "Price target gap": target_gap, "Insider cluster": extra.get("insider_90d"), "Institution net flow": None, "Clenow momentum": momentum,
     }
     pass_map = {}
     for key, value in tests.items():
@@ -177,7 +239,7 @@ def score_record(symbol: str, direction: str, thresholds: dict[str, float]) -> d
         elif key in {"Margins positive", "Margins expanding"}: pass_map[key] = value is not None and value >= threshold
         else: pass_map[key] = value is not None and (value >= threshold if is_long else value <= -threshold)
     score = sum(10 for ok in pass_map.values() if ok)
-    return {"Symbol": symbol, "Score": score, "Max": 120, "Price": price, "Target gap %": target_gap, "Revenue yoy %": metrics.get("revenue_yoy"), "EPS yoy %": metrics.get("eps_yoy"), "FCF yoy %": metrics.get("fcf_yoy"), "Margins %": metrics.get("net_margin"), "Insider 90d $": tests["Insider cluster"], "Recommendation": extra.get("recommendation", "NA"), "Direction": direction, "Metrics": metrics, "Extra": extra, "Criteria": pass_map}
+    return {"Symbol": symbol, "Score": score, "Max": 130, "Price": price, "Target gap %": target_gap, "Revenue yoy %": metrics.get("revenue_yoy"), "EPS yoy %": metrics.get("eps_yoy"), "FCF yoy %": metrics.get("fcf_yoy"), "Operating margin %": metrics.get("operating_margin"), "Margins %": metrics.get("operating_margin"), "Insider 90d $": tests["Insider cluster"], "Clenow Momentum": momentum, "Recommendation": extra.get("recommendation", "NA"), "Direction": direction, "Metrics": metrics, "Extra": extra, "Criteria": pass_map}
 
 
 def tech_flags(frame: pd.DataFrame, direction: str) -> dict[str, Any]:
@@ -247,8 +309,16 @@ def statement_frame(metrics: dict[str, Any], annual: bool = True) -> pd.DataFram
     for section, label, _ in STATEMENT_LINES:
         if label not in values.index: continue
         line = values.loc[label]
-        output[f"{section} · {label}"] = line
-        output[f"{section} · {label} YoY %"] = line.pct_change(periods=1 if annual else 4) * 100
+        if label.endswith("Margin %") or label == "EPS":
+            display_label = label
+        elif label == "Shares":
+            display_label = "Shares (mm)"
+            line = line / 1_000_000
+        else:
+            display_label = f"{label} ($mm)"
+            line = line / 1_000_000
+        output[f"{section} · {display_label}"] = line
+        output[f"{section} · {display_label} YoY %"] = line.pct_change(periods=1 if annual else 4) * 100
     result = pd.DataFrame(output).T
     result.columns = [str(c) for c in result.columns]
     return result
@@ -273,21 +343,66 @@ def peer_metric_frame(symbols: list[str], line: str, annual: bool = True) -> pd.
     return frame
 
 
+@st.cache_data(ttl=86400, show_spinner=False)
+def closest_peers(symbol: str) -> list[str]:
+    """Use the provider industry label as a GICS-subindustry fallback, ranked by market cap."""
+    target = enrichment(symbol)
+    candidates = list(dict.fromkeys(TOP_MARKET_CAP_DEFAULT + DEFAULT_UNIVERSE))
+    rows = []
+    for candidate in candidates:
+        if candidate == symbol: continue
+        info = enrichment(candidate)
+        if target.get("gics_industry") and info.get("gics_industry") != target.get("gics_industry"): continue
+        rows.append((candidate, info.get("market_cap") or 0))
+    return [candidate for candidate, _ in sorted(rows, key=lambda x: x[1], reverse=True)[:4]]
+
+
+def style_financial_table(frame: pd.DataFrame, peer_frames: list[pd.DataFrame] | None = None):
+    if frame.empty: return frame
+    peer_frames = peer_frames or []
+    peer_yoy = pd.concat([p for p in peer_frames if not p.empty], axis=0) if peer_frames else pd.DataFrame()
+    def style(data: pd.DataFrame):
+        out = pd.DataFrame("", index=data.index, columns=data.columns)
+        for idx in data.index:
+            if "YoY %" not in str(idx): continue
+            for col in data.columns:
+                value = pd.to_numeric(data.loc[idx, col], errors="coerce")
+                peers = pd.to_numeric(peer_yoy.loc[idx, col], errors="coerce") if not peer_yoy.empty and idx in peer_yoy.index and col in peer_yoy.columns else pd.Series(dtype=float)
+                peers = peers.dropna()
+                if pd.notna(value) and len(peers) and value >= peers.mean():
+                    out.loc[idx, col] = "background-color: #effaf0"
+                if pd.notna(value) and len(peers) and value >= peers.max():
+                    out.loc[idx, col] = "background-color: #d8f3dc"
+        return out
+    return frame.style.apply(style, axis=None).format(lambda value: "NA" if pd.isna(value) else (f"{value:,.1f}" if isinstance(value, (float, np.floating)) else value))
+
+
+def default_dcf_price(metrics: dict[str, Any], extra: dict[str, Any]) -> float | None:
+    revenue = metrics.get("revenue")
+    shares = metrics.get("shares")
+    if not isinstance(revenue, pd.Series) or revenue.empty or not isinstance(shares, pd.Series) or shares.empty: return None
+    growth = pct(extra.get("analyst_growth")) or 12.0
+    margin = metrics.get("operating_margin") or 20.0
+    net_income = np.array([float(revenue.iloc[-1]) * (1 + growth / 100) ** i * margin / 100 * .79 for i in range(1, 6)])
+    pv = float((net_income / (1.09 ** np.arange(1, 6))).sum())
+    return pv / float(shares.iloc[-1])
+
+
 def main() -> None:
     st.title("Equity Signal Lab")
     st.caption("A filing-aware NYSE/Nasdaq research workbench — signals are screening heuristics, not investment advice.")
     with st.sidebar:
         st.header("Universe & setup")
-        use_demo = st.checkbox("Use compact demo universe", value=True)
-        universe = DEFAULT_UNIVERSE if use_demo else listed_universe()
+        use_demo = st.checkbox("Use compact demo universe", value=False)
+        universe = DEFAULT_UNIVERSE if use_demo else top_market_cap_universe()
         selected = st.multiselect("Symbols", universe, default=universe[:8])
         scan_all = st.checkbox("Scan full listed universe", value=False, disabled=use_demo, help="Uses Nasdaq Trader's Nasdaq and other-listed symbol files. This can take time and is rate-limited by data providers.")
         direction = st.radio("Rank", ["Long", "Short"], horizontal=True)
         st.caption("Primary sources: SEC Company Facts and filings. Market/analyst enrichment: Yahoo Finance.")
         st.divider(); st.header("Screen thresholds")
         with st.form("screen_form"):
-            thresholds = {"Revenue growth": st.slider("Revenue growth YoY %", -50, 100, 15 if direction == "Long" else -15), "EPS growth": st.slider("EPS growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Earnings beats": st.slider("Earnings beats, past year", 0, 4, 3), "FCF growth": st.slider("FCF growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Margins positive": st.slider("Operating margin %", -50, 50, 0), "Margins expanding": st.slider("Margin expansion YoY pts", -50, 50, 0), "Buy share trend": st.slider("Buy recommendation change pts", -100, 100, 0), "Target trend": st.slider("Target change YoY %", -100, 200, 0), "Price target gap": st.slider("Price target gap %", -100, 200, 15 if direction == "Long" else -15), "Insider cluster": st.slider("Insider cluster / 90d $", 0, 10_000_000, 0), "Institution net flow": st.slider("Institution net flow $", -10_000_000, 10_000_000, 0)}
-            min_score = st.slider("Minimum score to show", 0, 120, 60, step=10)
+            thresholds = {"Revenue growth": st.slider("Revenue growth YoY %", -50, 100, 15 if direction == "Long" else -15), "EPS growth": st.slider("EPS growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Earnings beats": st.slider("Earnings beats, past year", 0, 4, 3), "FCF growth": st.slider("FCF growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Margins positive": st.slider("Operating margin %", -50, 50, 0), "Margins expanding": st.slider("Margin expansion YoY pts", -50, 50, 0), "Buy share trend": st.slider("Buy recommendation change pts", -100, 100, 0), "Target trend": st.slider("Target change YoY %", -100, 200, 0), "Price target gap": st.slider("Price target gap %", -100, 200, 15 if direction == "Long" else -15), "Insider cluster": st.slider("Insider cluster / 90d $", 0, 10_000_000, 0), "Institution net flow": st.slider("Institution net flow $", -10_000_000, 10_000_000, 0), "Clenow momentum": st.slider("Clenow Momentum %", -100, 500, 0 if direction == "Long" else 0)}
+            min_score = st.slider("Minimum score to show", 0, 130, 60, step=10)
             scan = st.form_submit_button("Scan universe", type="primary", use_container_width=True)
     if scan:
         if not selected:
@@ -308,7 +423,7 @@ def main() -> None:
     filtered_table = pd.DataFrame(filtered_records).sort_values("Score", ascending=False) if filtered_records else pd.DataFrame(columns=table.columns)
     candidate_symbols = [r["Symbol"] for r in filtered_records] or [r["Symbol"] for r in records]
 
-    tab1, tab2, tab3, tab4 = st.tabs(["1 · Screener", "2 · Technicals", "3 · Company deep dive", "4 · Daily chart"])
+    tab1, tab3 = st.tabs(["1 · Screener", "2 · Company deep dive"])
     with tab1:
         st.subheader(f"Scanned {direction.lower()} candidates")
         display = filtered_table.copy()
@@ -317,46 +432,56 @@ def main() -> None:
             display["Marketplace"] = display.Symbol.map({r["Symbol"]: r["Extra"].get("marketplace", "NA") for r in filtered_records})
             display["Current Price"] = display["Price"]
             display["Analyst Consensus"] = display["Recommendation"]
-        columns = ["Symbol", "Score", "Max", "GICS Industry", "Marketplace", "Current Price", "Analyst Consensus", "Target gap %", "Revenue yoy %", "EPS yoy %", "FCF yoy %", "Margins %", "Insider 90d $"]
+        for row in filtered_records:
+            row["Technical"] = tech_flags(prices(row["Symbol"], "2y"), direction)
+        if not display.empty:
+            display["At EMA/support"] = display.Symbol.map({r["Symbol"]: r["Technical"].get("near_level", False) for r in filtered_records})
+            display["Trend"] = display.Symbol.map({r["Symbol"]: r["Technical"].get("trend", "NA") for r in filtered_records})
+            display["2× volume"] = display.Symbol.map({r["Symbol"]: r["Technical"].get("high_volume", False) for r in filtered_records})
+            for criterion in ["Revenue growth", "EPS growth", "Earnings beats", "FCF growth", "Margins positive", "Margins expanding", "Analyst consensus", "Buy share trend", "Target trend", "Price target gap", "Insider cluster", "Institution net flow", "Clenow momentum"]:
+                display[criterion] = display.Symbol.map({r["Symbol"]: "Pass" if r["Criteria"].get(criterion) else "No/NA" for r in filtered_records})
+        columns = ["Symbol", "Score", "Max", "GICS Industry", "Marketplace", "Current Price", "Analyst Consensus", "Revenue yoy %", "EPS yoy %", "FCF yoy %", "Operating margin %", "Target gap %", "Insider 90d $", "Clenow Momentum", "At EMA/support", "Trend", "2× volume", "Revenue growth", "EPS growth", "Earnings beats", "FCF growth", "Margins positive", "Margins expanding", "Buy share trend", "Target trend", "Insider cluster", "Institution net flow"]
         st.dataframe(display[columns] if not display.empty else pd.DataFrame(columns=columns), use_container_width=True, hide_index=True)
         st.caption(f"{len(filtered_records)} of {len(records)} scanned symbols meet the {config['min_score']}-point minimum. Margins % is operating margin. Each satisfied criterion contributes 10 points; NA data is neutral.")
         st.caption("Each of 12 criteria contributes 10 points. NA data is neutral; inspect source coverage before acting. Earnings surprises, Form 4 clusters, and 13F flow require a filing parser or licensed feed when Yahoo does not expose them.")
         cols = st.columns(3)
-        for col, title, keys in zip(cols, ["Fundamentals", "Valuation", "Insider activity"], [["Revenue yoy %", "EPS yoy %", "FCF yoy %", "Margins %"], ["Recommendation", "Target gap %"], ["Insider 90d $"]]):
+        for col, title, keys in zip(cols, ["Fundamentals", "Valuation", "Insider activity"], [["Revenue yoy %", "EPS yoy %", "FCF yoy %", "Operating margin %"], ["Analyst Consensus", "Target gap %"], ["Insider 90d $", "Clenow Momentum"]]):
             with col:
                 st.markdown(f"**{title}**")
                 st.write(", ".join(keys))
                 st.progress(min(float(filtered_table.Score.max()) / max(float(filtered_table.Max.max()), 1), 1) if not filtered_table.empty else 0)
-    with tab2:
-        st.subheader("Technical confirmation")
-        tech_rows = []
-        for row in filtered_records or records:
-            flags = tech_flags(prices(row["Symbol"], "2y"), direction)
-            tech_rows.append({"Symbol": row["Symbol"], "At EMA/support": flags.get("near_level", False), "Trend": flags.get("trend", "NA"), "2× volume": flags.get("high_volume", False), "Level": flags.get("support_resistance")})
-        st.dataframe(pd.DataFrame(tech_rows), use_container_width=True, hide_index=True)
-        st.caption("Longs seek EMA/support, rising structure, or 2× volume. Shorts invert the level and trend interpretation.")
     with tab3:
         symbol = st.selectbox("Company", candidate_symbols, key="deep_company")
         row = next(r for r in records if r["Symbol"] == symbol); metrics = row["Metrics"]; extra = row["Extra"]
         st.subheader(f"{symbol} · {extra.get('sector', 'Sector unavailable')}")
         st.write(extra.get("summary") or "Business summary unavailable from the current provider.")
-        a, b, c, d = st.columns(4); a.metric("Market cap", fmt(extra.get("market_cap"))); b.metric("Revenue YoY", fmt(metrics.get("revenue_yoy"), "%")); c.metric("Net margin", fmt(metrics.get("net_margin"), "%")); d.metric("SEC CIK", metrics.get("cik") or "NA")
+        dcf_default = default_dcf_price(metrics, extra); consensus_target = extra.get("target"); current_price = extra.get("price")
+        dcf_upside = dcf_default / current_price - 1 if dcf_default and current_price else None
+        consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
+        a, b, c, d, e, f = st.columns(6)
+        a.metric("Market cap", fmt(extra.get("market_cap"))); b.metric("Stock price", fmt(current_price)); c.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); d.metric("Analyst consensus", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); e.metric("Last earnings", extra.get("last_earnings") or "NA"); f.metric("Next earnings", extra.get("next_earnings") or "NA")
+        chart_frame = prices(symbol, "2y")
+        if not chart_frame.empty:
+            st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
+        st.caption("Daily OHLCV from Yahoo Finance. EMA colors: 20-day cyan, 200-day orange, 200-week thick yellow; purple marks the latest available insider activity.")
         st.markdown("**Reported financials (SEC XBRL facts)**")
         annual_view = st.radio("Reporting period", ["Annual", "Quarterly"], horizontal=True, key="reporting_period") == "Annual"
         company_table = statement_frame(metrics, annual=annual_view)
-        st.dataframe(company_table, use_container_width=True)
-        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", value="MSFT, GOOGL, AMZN" if symbol == "AAPL" else "AAPL, MSFT, GOOGL").split(",") if p.strip() and p.strip().upper() != symbol][:3]
+        default_peer_list = closest_peers(symbol)
+        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", value=", ".join(default_peer_list)).split(",") if p.strip() and p.strip().upper() != symbol][:4]
+        peer_tables = [statement_frame(filing_metrics(peer), annual=annual_view) for peer in peers]
+        st.markdown("**Reported financials — selected stock**")
+        st.dataframe(style_financial_table(company_table, peer_tables), use_container_width=True)
         peer_label = st.selectbox("Comparison table", ["Industry average"] + [f"Peer {i + 1} · {p}" for i, p in enumerate(peers)], key="peer_table")
-        peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1] if peer_label.startswith("Peer") else None
-        if peer_symbol:
-            st.dataframe(statement_frame(filing_metrics(peer_symbol), annual=annual_view), use_container_width=True)
+        if peer_label == "Industry average":
+            aligned = [p for p in peer_tables if not p.empty]
+            comparison_table = pd.concat(aligned).groupby(level=0).mean() if aligned else pd.DataFrame()
         else:
-            peer_rows = []
-            for peer in peers:
-                peer_metrics = filing_metrics(peer); peer_info = enrichment(peer)
-                peer_rows.append({"Company": peer, "GICS Industry": peer_info.get("gics_industry", "NA"), "Marketplace": peer_info.get("marketplace", "NA"), "Current Price": peer_info.get("price"), "Revenue YoY %": peer_metrics.get("revenue_yoy"), "Operating margin %": peer_metrics.get("operating_margin")})
-            st.dataframe(pd.DataFrame(peer_rows), use_container_width=True, hide_index=True)
-        available_lines = [label for _, label, _ in STATEMENT_LINES if label in company_table.index and "YoY" not in label]
+            peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1]
+            comparison_table = statement_frame(filing_metrics(peer_symbol), annual=annual_view)
+        st.markdown(f"**Reported financials — {peer_label}**")
+        st.dataframe(style_financial_table(comparison_table), use_container_width=True)
+        available_lines = [label for _, label, _ in STATEMENT_LINES if any(str(index).endswith(f"· {label} ($mm)") or str(index).endswith(f"· {label}") for index in company_table.index)]
         if available_lines:
             selected_line = st.selectbox("Financial line for peer chart", available_lines, key="financial_line")
             comparison = peer_metric_frame([symbol] + peers, selected_line, annual=annual_view)
@@ -393,12 +518,7 @@ def main() -> None:
         current_price = extra.get("price")
         dcf_upside = dcf_price / current_price - 1 if dcf_price and current_price else None
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
-        m1, m2, m3 = st.columns(3); m1.metric("DCF stock price", fmt(dcf_price), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); m2.metric("Analyst consensus", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); m3.metric("Current price", fmt(current_price))
-    with tab4:
-        symbol = st.selectbox("Chart company", candidate_symbols, key="chart_company"); row = next(r for r in records if r["Symbol"] == symbol); frame = prices(symbol, "2y")
-        if frame.empty: st.warning("No daily price history available.")
-        else: st.plotly_chart(chart(symbol, frame, direction, row.get("Insider 90d $")), use_container_width=True)
-        st.caption("Daily OHLCV from Yahoo Finance. EMA colors: 20-day cyan, 200-day orange, 200-week thick yellow; purple marks the latest available insider activity.")
+        st.caption(f"Editable DCF output: {fmt(dcf_price)} per share. The headline DCF and analyst consensus metrics remain at the top of this tab.")
 
 
 if __name__ == "__main__":
