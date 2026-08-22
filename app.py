@@ -335,18 +335,67 @@ def tech_flags(frame: pd.DataFrame, direction: str) -> dict[str, Any]:
     return {"near_level": near, "trend": shape, "high_volume": bool(avgvol and frame.Volume.iloc[-1] >= 2 * avgvol), "EMA20": ema20, "EMA200": ema200, "EMA200W": ema_week, "support_resistance": supports}
 
 
+def clenow_regression(frame: pd.DataFrame, window: int = 90) -> dict[str, Any]:
+    close = pd.to_numeric(frame.get("Close", pd.Series(dtype=float)).tail(window), errors="coerce").dropna()
+    if len(close) < window or (close <= 0).any(): return {}
+    x = np.arange(window, dtype=float); y = np.log(close.to_numpy(dtype=float)); slope, intercept = np.polyfit(x, y, 1); fitted = slope * x + intercept
+    residual = y - fitted; std = float(residual.std()); ss_res = float((residual ** 2).sum()); ss_tot = float(((y - y.mean()) ** 2).sum()); r2 = 1 - ss_res / ss_tot if ss_tot else 0.0
+    return {"dates": close.index, "fit": np.exp(fitted), "upper": np.exp(fitted + 2 * std), "lower": np.exp(fitted - 2 * std), "slope": slope, "r2": r2}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def earnings_history(symbol: str) -> pd.DataFrame:
+    try:
+        frame = yf.Ticker(symbol).get_earnings_dates(limit=16)
+        if frame is None or frame.empty: return pd.DataFrame()
+        frame = frame.reset_index().rename(columns={frame.index.name or "index": "Date"})
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.tz_localize(None)
+        return frame.sort_values("Date")
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def analyst_actions(symbol: str) -> pd.DataFrame:
+    try:
+        frame = yf.Ticker(symbol).upgrades_downgrades
+        if frame is None or frame.empty: return pd.DataFrame()
+        frame = frame.reset_index().rename(columns={frame.index.name or "index": "Date"})
+        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce").dt.tz_localize(None)
+        return frame.sort_values("Date")
+    except Exception:
+        return pd.DataFrame()
+
+
 def chart(symbol: str, frame: pd.DataFrame, direction: str, insider_value: Any) -> go.Figure:
     t = tech_flags(frame, direction); fig = make_subplots(specs=[[{"secondary_y": True}]])
-    fig.add_trace(go.Candlestick(x=frame.index, open=frame.Open, high=frame.High, low=frame.Low, close=frame.Close, name=symbol))
-    for key, color, width in [("EMA20", "cyan", 1), ("EMA200", "orange", 1), ("EMA200W", "yellow", 3)]:
-        fig.add_trace(go.Scatter(x=frame.index, y=t[key], name=key, line={"color": color, "width": width}))
+    fig.add_trace(go.Candlestick(x=frame.index, open=frame.Open, high=frame.High, low=frame.Low, close=frame.Close, name=symbol, hovertemplate="%{x|%Y-%m-%d}<br>Open %{open:.2f}<br>High %{high:.2f}<br>Low %{low:.2f}<br>Close %{close:.2f}<extra></extra>"))
+    for key, color, width in [("EMA20", "orange", 1), ("EMA200", "gold", 1), ("EMA200W", "gold", 3)]:
+        fig.add_trace(go.Scatter(x=frame.index, y=t[key], name=key, line={"color": color, "width": width}, hovertemplate=f"%{{x|%Y-%m-%d}}<br>{key} %{{y:.2f}}<extra></extra>"))
+    regression = clenow_regression(frame)
+    if regression:
+        fig.add_trace(go.Scatter(x=regression["dates"], y=regression["upper"], name="Clenow channel", line={"color": "rgba(120,180,255,.25)", "width": 1}, hoverinfo="skip"))
+        fig.add_trace(go.Scatter(x=regression["dates"], y=regression["lower"], name="Clenow channel", line={"color": "rgba(120,180,255,.25)", "width": 1}, fill="tonexty", fillcolor="rgba(120,180,255,.12)", hoverinfo="skip"))
+        fig.add_annotation(x=0.01, y=0.98, xref="paper", yref="paper", text=f"Clenow slope {100 * (np.exp(regression['slope'] * 250) - 1):.1f}% · R² {regression['r2']:.2f}", showarrow=False, bgcolor="rgba(20,30,45,.75)")
     trades = insider_trades(symbol)
     if not trades.empty:
         visible = trades[trades.Date >= frame.index.min()]
         fig.add_trace(go.Bar(x=visible.Date, y=visible["Buy volume"], name="Insider purchases", marker_color="#2ca02c", opacity=.55, hovertemplate="Buy volume: $%{y:,.0f}<extra></extra>"), secondary_y=True)
         fig.add_trace(go.Bar(x=visible.Date, y=-visible["Sell volume"], name="Insider sales", marker_color="#d62728", opacity=.55, hovertemplate="Sale volume: $%{customdata:,.0f}<extra></extra>", customdata=visible["Sell volume"]), secondary_y=True)
+    earnings = earnings_history(symbol)
+    if not earnings.empty:
+        for _, event in earnings.iterrows():
+            if pd.notna(event.Date) and frame.index.min() <= event.Date <= frame.index.max():
+                fig.add_vline(x=event.Date, line_color="rgba(80,220,120,.6)", line_dash="dot", annotation_text="EPS", annotation_position="top")
+    actions = analyst_actions(symbol)
+    if not actions.empty:
+        for _, event in actions.tail(12).iterrows():
+            if pd.notna(event.Date) and frame.index.min() <= event.Date <= frame.index.max():
+                fig.add_vline(x=event.Date, line_color="rgba(200,150,255,.55)", line_dash="dash", annotation_text="Analyst", annotation_position="bottom")
+    fig.add_annotation(x=1.02, y=0.82, xref="paper", yref="paper", text="ⓘ Insider", showarrow=False, font={"color": "#d8b4fe"})
+    fig.add_annotation(x=1.02, y=0.68, xref="paper", yref="paper", text="ⓘ EPS / actions", showarrow=False, font={"color": "#86efac"})
     fig.update_yaxes(title_text="Close", secondary_y=False); fig.update_yaxes(title_text="Insider trade volume ($)", secondary_y=True, zeroline=True)
-    fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False, legend_orientation="h", barmode="relative")
+    fig.update_layout(height=650, template="plotly_dark", xaxis_rangeslider_visible=False, legend_orientation="h", barmode="relative", margin={"r": 125, "t": 50, "b": 40, "l": 60})
     return fig
 
 
@@ -455,15 +504,24 @@ def style_financial_table(frame: pd.DataFrame, peer_frames: list[pd.DataFrame] |
     def style(data: pd.DataFrame):
         out = pd.DataFrame("", index=data.index, columns=data.columns)
         for idx in data.index:
+            label = str(idx)
+            if "YoY %" in label:
+                out.loc[idx, :] = "color: #4b5563; font-style: italic;"
+            if any(token in label for token in ["Total ", "Gross Profit", "Operating Income", "Net Income", "Cash Flow from Operations", "Free Cash Flow"]):
+                out.loc[idx, :] = out.loc[idx, :].map(lambda current: f"{current} font-weight: 700;" if current else "font-weight: 700;")
+            elif "YoY %" not in label:
+                out.loc[idx, :] = out.loc[idx, :].map(lambda current: f"{current} padding-left: 18px;" if current else "padding-left: 18px;")
+            if label.startswith("Income statement") and "Revenue" in label or label.startswith("Balance sheet") and "Cash" in label or label.startswith("Statement of cash flow") and "Net income" in label:
+                out.loc[idx, :] = out.loc[idx, :].map(lambda current: f"{current} border-top: 2px solid #475569;" if current else "border-top: 2px solid #475569;")
             if "YoY %" not in str(idx): continue
             for col in data.columns:
                 value = pd.to_numeric(data.loc[idx, col], errors="coerce")
                 peers = pd.to_numeric(peer_yoy.loc[idx, col], errors="coerce") if not peer_yoy.empty and idx in peer_yoy.index and col in peer_yoy.columns else pd.Series(dtype=float)
                 peers = peers.dropna()
                 if pd.notna(value) and len(peers) and value >= peers.mean():
-                    out.loc[idx, col] = "background-color: #effaf0"
+                    out.loc[idx, col] = f"{out.loc[idx, col]} background-color: #effaf0"
                 if pd.notna(value) and len(peers) and value >= peers.max():
-                    out.loc[idx, col] = "background-color: #d8f3dc"
+                    out.loc[idx, col] = f"{out.loc[idx, col]} background-color: #d8f3dc"
         return out
     return frame.style.apply(style, axis=None).format(lambda value: "NA" if pd.isna(value) else (f"{value:,.1f}" if isinstance(value, (float, np.floating)) else value))
 
@@ -512,12 +570,42 @@ def valuation_frame(symbols: list[str]) -> pd.DataFrame:
         metrics = filing_metrics(symbol); extra = enrichment(symbol); cap = extra.get("market_cap") or 0
         revenue = ttm(metrics.get("revenue")); net = ttm(metrics.get("net")); cfo = ttm(metrics.get("cfo")); fcf = cfo - ttm(metrics.get("capex")); equity = float(metrics["equity"].iloc[-1]) if isinstance(metrics.get("equity"), pd.Series) and not metrics["equity"].empty else 0
         pe = cap / net if cap and net > 0 else None; growth = pct(extra.get("analyst_growth")) or metrics.get("eps_yoy")
-        rows.append({"Company": symbol, "P/S": cap / revenue if cap and revenue else None, "P/E": pe, "PEG": pe / growth if pe and growth and growth > 0 else None, "P/OCF": cap / cfo if cap and cfo else None, "P/FCF": cap / fcf if cap and fcf > 0 else None, "P/B": cap / equity if cap and equity else None, "P/TBV": cap / equity if cap and equity else None})
+        rows.append({"Company": symbol, "Current Price": extra.get("price"), "P/S": cap / revenue if cap and revenue else None, "P/E": pe, "PEG": pe / growth if pe and growth and growth > 0 else None, "P/OCF": cap / cfo if cap and cfo else None, "P/FCF": cap / fcf if cap and fcf > 0 else None, "P/B": cap / equity if cap and equity else None, "P/TBV": cap / equity if cap and equity else None})
     frame = pd.DataFrame(rows)
     if not frame.empty:
         numeric = frame.drop(columns="Company").apply(pd.to_numeric, errors="coerce")
-        frame.loc[len(frame)] = ["Peer average"] + numeric.mean().tolist()
+        frame.loc[len(frame)] = ["Peer average", numeric["Current Price"].mean()] + numeric.drop(columns="Current Price").mean().tolist()
     return frame
+
+
+def style_valuation_table(frame: pd.DataFrame, selected_symbol: str):
+    if frame.empty: return frame
+    multiple_columns = [column for column in ["P/S", "P/E", "PEG", "P/OCF", "P/FCF", "P/B", "P/TBV"] if column in frame.columns]
+    def style(data: pd.DataFrame):
+        out = pd.DataFrame("", index=data.index, columns=data.columns)
+        peers = data[data.Company != "Peer average"]
+        average = data[data.Company == "Peer average"]
+        for idx, row in data.iterrows():
+            if row.get("Company") != selected_symbol: continue
+            for column in multiple_columns:
+                value = pd.to_numeric(row.get(column), errors="coerce")
+                peer_values = pd.to_numeric(peers[column], errors="coerce").dropna()
+                avg_value = float(average[column].iloc[0]) if not average.empty and pd.notna(average[column].iloc[0]) else None
+                if pd.notna(value) and avg_value is not None and value < avg_value: out.loc[idx, column] = "background-color: #effaf0"
+                if pd.notna(value) and len(peer_values) and value <= peer_values.min(): out.loc[idx, column] = "background-color: #d8f3dc"
+        return out
+    return frame.style.apply(style, axis=None).format({column: lambda value: "NA" if pd.isna(value) else f"{float(value):,.1f}" for column in frame.columns if column != "Company"})
+
+
+def multiple_price_targets(metrics: dict[str, Any], extra: dict[str, Any], peers: list[str]) -> dict[str, float | None]:
+    peer_frame = valuation_frame(peers)
+    if peer_frame.empty or "Peer average" not in peer_frame.Company.values: return {"Price/Sales": None, "Price/Earnings": None, "Price/PEG": None}
+    average = peer_frame[peer_frame.Company == "Peer average"].iloc[0]
+    shares = float(metrics["shares"].iloc[-1]) if isinstance(metrics.get("shares"), pd.Series) and not metrics["shares"].empty else 0
+    sales_per_share = ttm(metrics.get("revenue")) / shares if shares else 0
+    eps = ttm(metrics.get("net")) / shares if shares else 0
+    growth = pct(extra.get("analyst_growth")) or metrics.get("eps_yoy") or 0
+    return {"Price/Sales": float(average["P/S"] * sales_per_share) if pd.notna(average.get("P/S")) and sales_per_share else None, "Price/Earnings": float(average["P/E"] * eps) if pd.notna(average.get("P/E")) and eps else None, "Price/PEG": float(average["PEG"] * growth * eps / 100) if pd.notna(average.get("PEG")) and growth and eps else None}
 
 
 def main() -> None:
@@ -551,7 +639,7 @@ def main() -> None:
     records = st.session_state.get("screen_records", [])
     if not config or not records:
         st.info("Choose the universe and thresholds, then click **Scan universe**.")
-        return
+        config = {"direction": direction, "thresholds": {}, "min_score": 0, "selected": []}
     direction = config["direction"]
     table = pd.DataFrame(records)
     filtered_records = [r for r in records if r["Score"] >= config["min_score"]]
@@ -584,13 +672,23 @@ def main() -> None:
                 st.write(", ".join(keys))
                 st.progress(min(float(filtered_table.Score.max()) / max(float(filtered_table.Max.max()), 1), 1) if not filtered_table.empty else 0)
     with tab3:
-        symbol = st.selectbox("Company", candidate_symbols, key="deep_company")
-        row = next(r for r in records if r["Symbol"] == symbol); metrics = row["Metrics"]; extra = row["Extra"]
+        default_explore = candidate_symbols[0] if candidate_symbols else "AAPL"
+        symbol = st.text_input("Explore any stock", value=default_explore, key="deep_company_input").strip().upper()
+        if not re.fullmatch(r"[A-Z]{1,5}(?:[-.][A-Z]{1,2})?", symbol):
+            st.warning("Enter a valid ticker symbol.")
+            return
+        if symbol in {r["Symbol"] for r in records}:
+            row = next(r for r in records if r["Symbol"] == symbol); metrics = row["Metrics"]; extra = row["Extra"]
+        else:
+            with st.spinner(f"Loading {symbol}…"):
+                metrics = filing_metrics(symbol); extra = enrichment(symbol)
+            row = {"Symbol": symbol, "Metrics": metrics, "Extra": extra, "Insider 90d $": extra.get("insider_90d")}
         st.subheader(f"{symbol} · {extra.get('sector', 'Sector unavailable')}")
         st.write(extra.get("summary") or "Business summary unavailable from the current provider.")
         peer_source = st.radio("Peer source", ["Industry / market-cap", "Finviz first 3"], horizontal=True, key="peer_source")
         default_peer_list = finviz_peers(symbol) if peer_source == "Finviz first 3" else closest_peers(symbol)
         if not default_peer_list: default_peer_list = closest_peers(symbol)
+        multiple_targets = multiple_price_targets(metrics, extra, default_peer_list)
         peer_valuation = valuation_frame(default_peer_list)
         peer_average_summary = "NA"
         if not peer_valuation.empty and "Peer average" in peer_valuation.Company.values:
@@ -599,13 +697,13 @@ def main() -> None:
         dcf_default = default_dcf_price(metrics, extra); consensus_target = extra.get("target"); current_price = extra.get("price")
         dcf_upside = dcf_default / current_price - 1 if dcf_default and current_price else None
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
-        a, b, c, d, e, f, g = st.columns(7)
+        a, b, c, d = st.columns(4)
         cap_mm = extra.get("market_cap") / 1_000_000 if extra.get("market_cap") else None
-        a.metric("Market cap ($mm)", f"{cap_mm:,.1f}" if cap_mm is not None else "NA"); b.metric("Stock price", fmt(current_price)); c.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); d.metric("Analyst consensus", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); e.metric("Last earnings", extra.get("last_earnings") or "NA"); f.metric("Next earnings", extra.get("next_earnings") or "NA"); g.metric("Peer average valuation", peer_average_summary)
-        chart_frame = prices(symbol, "2y")
-        if not chart_frame.empty:
-            st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
-        st.caption("Daily OHLCV from Yahoo Finance. EMA colors: 20-day cyan, 200-day orange, 200-week thick yellow; purple marks the latest available insider activity.")
+        a.metric("Market cap ($mm)", f"{cap_mm:,.1f}" if cap_mm is not None else "NA"); b.metric("Stock price", fmt(current_price)); c.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); d.metric("Analyst consensus", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA")
+        a, b, c, d = st.columns(4)
+        a.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA"); b.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA"); c.metric("Price per PEG ratio", fmt(multiple_targets["Price/PEG"]), f"{multiple_targets['Price/PEG'] / current_price - 1:.1%} vs current" if multiple_targets["Price/PEG"] and current_price else "NA"); d.metric("Peer average valuation", peer_average_summary)
+        a, b, c, d = st.columns(4)
+        a.metric("Last earnings", extra.get("last_earnings") or "NA"); b.metric("Next earnings", extra.get("next_earnings") or "NA"); c.metric("GICS industry", extra.get("gics_industry") or "NA"); d.metric("Marketplace", extra.get("marketplace") or "NA")
         st.markdown("**Reported financials (SEC XBRL facts)**")
         annual_view = st.radio("Reporting period", ["Annual", "Quarterly"], horizontal=True, key="reporting_period") == "Annual"
         company_table = statement_frame(metrics, annual=annual_view)
@@ -616,14 +714,16 @@ def main() -> None:
         peer_label = st.selectbox("Comparison table", ["Industry average"] + [f"Peer {i + 1} · {p}" for i, p in enumerate(peers)], key="peer_table")
         if peer_label == "Industry average":
             aligned = [p for p in peer_tables if not p.empty]
-            comparison_table = pd.concat(aligned).groupby(level=0).mean() if aligned else pd.DataFrame()
+            comparison_table = pd.concat(aligned).groupby(level=0).mean().reindex(index=company_table.index, columns=company_table.columns) if aligned else pd.DataFrame(index=company_table.index, columns=company_table.columns)
         else:
             peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1]
             comparison_table = statement_frame(filing_metrics(peer_symbol), annual=annual_view)
         st.markdown(f"**Reported financials — {peer_label}**")
         st.dataframe(style_financial_table(comparison_table), use_container_width=True)
-        st.markdown("**Comparable valuation multiples**")
-        st.dataframe(valuation_frame([symbol] + peers), use_container_width=True, hide_index=True)
+        chart_frame = prices(symbol, "2y")
+        if not chart_frame.empty:
+            st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
+        st.caption("EMA colors: 20-day orange, 200-day gold, 200-week thick gold. The chart includes insider, earnings, analyst-action and Clenow annotations.")
         available_lines = [label for _, label, _ in STATEMENT_LINES if any(str(index).endswith(f"· {label} ($mm)") or str(index).endswith(f"· {label}") for index in company_table.index)]
         if available_lines:
             selected_line = st.selectbox("Financial line for peer chart", available_lines, key="financial_line")
@@ -632,7 +732,12 @@ def main() -> None:
                 latest_column = comparison.columns[-1]
                 chart_values = comparison[latest_column].rename("Latest reported value").to_frame()
                 st.markdown(f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**")
-                st.bar_chart(chart_values)
+                colors = ["#2563eb" if name == symbol else "#d1d5db" if name != "Industry average" else "#4b5563" for name in chart_values.index]
+                peer_fig = go.Figure(go.Bar(x=chart_values.index, y=chart_values.iloc[:, 0], marker_color=colors, hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>"))
+                peer_fig.update_layout(height=330, template="plotly_white", margin={"l": 20, "r": 20, "t": 20, "b": 60})
+                st.plotly_chart(peer_fig, use_container_width=True)
+        st.markdown("**Comparable valuation multiples**")
+        st.dataframe(style_valuation_table(valuation_frame([symbol] + peers), symbol), use_container_width=True, hide_index=True)
         st.markdown("**DCF workspace**")
         analyst_growth = pct(extra.get("analyst_growth")) or 12.0
         consensus_target = extra.get("target")
@@ -657,13 +762,26 @@ def main() -> None:
         forecast["Free Cash Flow"] = [base_cfo - base_capex] + [max(float(forecast.loc[i, "Net Income"]), 0) for i in range(1, 6)]
         amount_columns = [column for column in forecast.columns if column not in {"Year", "EPS"}]
         forecast_display = forecast.copy(); forecast_display[amount_columns] = forecast_display[amount_columns] / 1_000_000
-        st.dataframe(forecast_display.set_index("Year").T, use_container_width=True)
+        forecast_table = forecast_display.set_index("Year").T
+        st.dataframe(forecast_table.style.format({column: "{:,.1f}" for column in forecast_table.columns if column != "EPS"} | ({"EPS": "{:,.2f}"} if "EPS" in forecast_table.index else {})), use_container_width=True)
         fcf_forecast = forecast.loc[1:, "Free Cash Flow"].to_numpy(dtype=float); discount_rate = max(wacc / 100, terminal / 100 + .01); terminal_value = fcf_forecast[-1] * (1 + terminal / 100) / (discount_rate - terminal / 100) if fcf_forecast.size else 0
         pv_equity = float((fcf_forecast / (1 + discount_rate) ** np.arange(1, 6)).sum() + terminal_value / (1 + discount_rate) ** 5 + (extra.get("cash") or 0) - (extra.get("debt") or 0)) if base and shares else 0
         dcf_price = pv_equity / (shares * 1_000_000) if shares else None
         dcf_upside = dcf_price / current_price - 1 if dcf_price and current_price else None
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
         st.caption(f"Editable DCF output: {fmt(dcf_price)} per share. The headline DCF and analyst consensus metrics remain at the top of this tab.")
+        st.markdown("**Insider transactions**")
+        insider_table = insider_trades(symbol)
+        st.dataframe(insider_table.sort_values("Date", ascending=False) if not insider_table.empty else pd.DataFrame({"Date": [], "Buy volume": [], "Sell volume": []}), use_container_width=True, hide_index=True)
+        st.markdown("**Earnings and analyst actions**")
+        earnings_table = earnings_history(symbol)
+        if not earnings_table.empty:
+            keep = [column for column in ["Date", "Reported EPS", "EPS Estimate", "Surprise(%)"] if column in earnings_table.columns]
+            st.dataframe(earnings_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
+        actions_table = analyst_actions(symbol)
+        if not actions_table.empty:
+            keep = [column for column in ["Date", "Firm", "To Grade", "From Grade", "Action"] if column in actions_table.columns]
+            st.dataframe(actions_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
