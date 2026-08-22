@@ -222,9 +222,18 @@ def finviz_snapshot(symbol: str) -> dict[str, Any]:
             for i, value in enumerate(flat[:-1]):
                 if value in {"Recom", "Insider Trans", "Target Price", "Exchange", "Earnings", "P/E", "P/S", "PEG", "P/FCF", "P/B"}:
                     pairs[value] = flat[i + 1]
+        peer_section = re.search(r">Peers<.*?(?:Held by|Scroll to Statements)", html, flags=re.I | re.S)
+        peer_html = peer_section.group(0) if peer_section else ""
+        pairs["Peers"] = list(dict.fromkeys(re.findall(r"quote\.ashx\?t=([A-Z0-9.-]+)", peer_html, flags=re.I)))[:3]
         return pairs
     except Exception:
         return {}
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def finviz_peers(symbol: str) -> list[str]:
+    peers = finviz_snapshot(symbol).get("Peers", [])
+    return [str(peer).upper() for peer in peers if str(peer).upper() != symbol.upper()][:3]
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -473,7 +482,12 @@ def style_screener_table(frame: pd.DataFrame, records: list[dict[str, Any]]):
                     out.loc[row_index, column] = green
         return out
     formatted = rounded_percent_columns(frame)
-    return formatted.style.apply(style, axis=None).format({column: "{:.1f}" for column in formatted.columns if "%" in str(column) or "Momentum" in str(column)})
+    def safe_one_decimal(value: Any) -> str:
+        if value is None or (isinstance(value, float) and np.isnan(value)): return "NA"
+        try: return f"{float(str(value).replace('%', '').replace(',', '')):.1f}"
+        except (TypeError, ValueError): return str(value)
+    formatters = {column: safe_one_decimal for column in formatted.columns if "%" in str(column) or "Momentum" in str(column)}
+    return formatted.style.apply(style, axis=None).format(formatters)
 
 
 def default_dcf_price(metrics: dict[str, Any], extra: dict[str, Any]) -> float | None:
@@ -574,7 +588,9 @@ def main() -> None:
         row = next(r for r in records if r["Symbol"] == symbol); metrics = row["Metrics"]; extra = row["Extra"]
         st.subheader(f"{symbol} · {extra.get('sector', 'Sector unavailable')}")
         st.write(extra.get("summary") or "Business summary unavailable from the current provider.")
-        default_peer_list = closest_peers(symbol)
+        peer_source = st.radio("Peer source", ["Industry / market-cap", "Finviz first 3"], horizontal=True, key="peer_source")
+        default_peer_list = finviz_peers(symbol) if peer_source == "Finviz first 3" else closest_peers(symbol)
+        if not default_peer_list: default_peer_list = closest_peers(symbol)
         peer_valuation = valuation_frame(default_peer_list)
         peer_average_summary = "NA"
         if not peer_valuation.empty and "Peer average" in peer_valuation.Company.values:
