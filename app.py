@@ -25,6 +25,7 @@ st.set_page_config(page_title="Equity Signal Lab", page_icon="◒", layout="wide
 SEC_HEADERS = {"User-Agent": "Equity Signal Lab research app contact@example.com"}
 DEFAULT_UNIVERSE = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "AVGO", "JPM", "LLY", "TSLA", "AMD", "NFLX"]
 TOP_MARKET_CAP_DEFAULT = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "AVGO", "TSLA", "BRK-B", "LLY"]
+PEER_CANDIDATES = ["AAPL", "MSFT", "GOOGL", "GOOG", "META", "AMZN", "NVDA", "AVGO", "AMD", "QCOM", "TSM", "ORCL", "CRM", "ADBE", "CSCO", "IBM", "INTC", "MU", "DELL", "HPQ", "JPM", "BAC", "WFC", "C", "GS", "MS", "BLK", "SCHW", "USB", "PNC", "COF", "BROS", "SBUX", "MCD", "CMG", "YUM", "DPZ", "WMT", "TGT", "COST", "HD", "LOW", "LLY", "JNJ", "MRK", "PFE", "UNH", "ABBV", "XOM", "CVX", "COP", "CAT", "DE", "HON", "GE", "RTX", "BA"]
 
 
 def pct(value: Any) -> float | None:
@@ -51,7 +52,7 @@ def parse_symbol_list(text: str) -> list[str]:
 def rounded_percent_columns(frame: pd.DataFrame) -> pd.DataFrame:
     result = frame.copy()
     for column in result.columns:
-        if "%" in str(column) or "Momentum" in str(column):
+        if "%" in str(column) or "Momentum" in str(column) or str(column) == "RAAM":
             result[column] = result[column].map(lambda value: round(float(str(value).replace("%", "").replace(",", "")), 1) if str(value).strip().replace("%", "").replace(",", "").replace(".", "", 1).replace("-", "", 1).isdigit() else value)
     return result
 
@@ -71,6 +72,22 @@ def clenow_momentum(frame: pd.DataFrame, window: int = 90) -> float | None:
     ss_tot = float(np.square(y - y.mean()).sum())
     r_squared = 1 - ss_res / ss_tot if ss_tot else 0.0
     return float(100 * (np.exp(slope * 250) - 1) * max(0.0, r_squared))
+
+
+def raam_score(frame: pd.DataFrame) -> float | None:
+    """Transparent RAAM-style composite using momentum, volatility, correlation and trend."""
+    if frame.empty or len(frame) < 130: return None
+    close = pd.to_numeric(frame["Close"], errors="coerce").dropna()
+    if len(close) < 130: return None
+    momentum = float(close.iloc[-1] / close.iloc[-126] - 1)
+    volatility = float(close.pct_change().tail(63).std() * np.sqrt(250))
+    benchmark = prices("SPY", "1y")
+    aligned = pd.concat([close.pct_change().rename("asset"), benchmark["Close"].pct_change().rename("benchmark")], axis=1).dropna() if not benchmark.empty else pd.DataFrame()
+    correlation = abs(float(aligned.asset.corr(aligned.benchmark))) if len(aligned) > 20 else .5
+    atr = pd.concat([(frame.High - frame.Low), (frame.High - frame.Close.shift()).abs(), (frame.Low - frame.Close.shift()).abs()], axis=1).max(axis=1).rolling(42).mean().iloc[-1]
+    breakout = float(close.iloc[-1] > (close.tail(63).max() + 2 * atr)) if pd.notna(atr) else 0.0
+    momentum_component = float(np.clip((momentum + .25) / .75, 0, 1)); volatility_component = float(np.clip(1 - volatility, 0, 1)); correlation_component = float(np.clip(1 - correlation, 0, 1)); trend_component = .75 if close.iloc[-1] > close.ewm(span=200, adjust=False).mean().iloc[-1] else .25
+    return round(100 * (.4 * momentum_component + .2 * volatility_component + .2 * correlation_component + .2 * trend_component), 1)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -181,6 +198,11 @@ def filing_metrics(symbol: str) -> dict[str, Any]:
         "long_term_lease": fact_series(bundle, ["OperatingLeaseLiabilityNoncurrent"]), "long_term_debt": fact_series(bundle, ["LongTermDebtNoncurrent"]), "other_liabilities": fact_series(bundle, ["OtherLiabilitiesNoncurrent"]), "preferred_stock": fact_series(bundle, ["PreferredStocksIncludingAdditionalPaidInCapital"]), "common_stock": fact_series(bundle, ["CommonStocksIncludingAdditionalPaidInCapital"]), "apic": fact_series(bundle, ["AdditionalPaidInCapital"]), "aoci": fact_series(bundle, ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"]), "retained_earnings": fact_series(bundle, ["RetainedEarningsAccumulatedDeficit"]), "noncontrolling": fact_series(bundle, ["MinorityInterest"]),
         "depreciation": fact_series(bundle, ["DepreciationDepletionAndAmortization"]), "equity_comp": fact_series(bundle, ["ShareBasedCompensation"]), "deferred_taxes": fact_series(bundle, ["DeferredIncomeTaxExpenseBenefit"]), "change_receivables": fact_series(bundle, ["IncreaseDecreaseInAccountsReceivable"]), "change_inventory": fact_series(bundle, ["IncreaseDecreaseInInventories"]), "change_payables": fact_series(bundle, ["IncreaseDecreaseInAccountsPayable"]), "change_other_current": fact_series(bundle, ["IncreaseDecreaseInOtherOperatingAssets"]), "change_other_liabilities": fact_series(bundle, ["IncreaseDecreaseInOtherOperatingLiabilities"]), "proceeds_debt": fact_series(bundle, ["ProceedsFromIssuanceOfLongTermDebt"]), "payments_debt": fact_series(bundle, ["RepaymentsOfLongTermDebt"]), "cash_begin": fact_series(bundle, ["CashAndCashEquivalentsAtCarryingValue"]),
     })
+    if result["gross"].empty and not result["revenue"].empty and not result["cogs"].empty:
+        result["gross"] = result["revenue"].subtract(result["cogs"], fill_value=np.nan)
+    if result["opex"].empty and (not result["rd"].empty or not result["ga"].empty):
+        result["opex"] = result["rd"].add(result["ga"], fill_value=0)
+    gross = result["gross"]
     result["revenue_yoy"] = latest_yoy(revenue)
     result["eps_yoy"] = latest_yoy(eps)
     result["fcf_yoy"] = latest_yoy(cfo)
@@ -310,7 +332,9 @@ def enrichment(symbol: str) -> dict[str, Any]:
 def score_record(symbol: str, direction: str, thresholds: dict[str, float]) -> dict[str, Any]:
     metrics = filing_metrics(symbol)
     extra = enrichment(symbol)
-    momentum = clenow_momentum(prices(symbol, "1y"))
+    price_frame = prices(symbol, "1y")
+    momentum = clenow_momentum(price_frame)
+    raam = raam_score(price_frame)
     price = extra.get("price")
     target = extra.get("target")
     target_gap = (target / price - 1) * 100 if price and target else None
@@ -319,17 +343,18 @@ def score_record(symbol: str, direction: str, thresholds: dict[str, float]) -> d
         "Revenue growth": metrics.get("revenue_yoy"), "EPS growth": metrics.get("eps_yoy"), "Earnings beats": None,
         "FCF growth": metrics.get("fcf_yoy"), "Margins positive": min([x for x in [metrics.get("gross_margin"), metrics.get("operating_margin"), metrics.get("net_margin")] if x is not None], default=None),
         "Margins expanding": None, "Analyst consensus": 1 if extra.get("consensus_key") in ({"buy", "strong_buy", "hold"} if is_long else {"hold", "sell", "strong_sell"}) else 0,
-        "Buy share trend": None, "Target trend": None, "Price target gap": target_gap, "Insider cluster": extra.get("insider_90d"), "Institution net flow": None, "Clenow momentum": momentum,
+        "Buy share trend": None, "Target trend": None, "Price target gap": target_gap, "Insider cluster": extra.get("insider_90d"), "Institution net flow": None, "Clenow momentum": momentum, "RAAM": raam,
     }
     pass_map = {}
     for key, value in tests.items():
         threshold = thresholds.get(key, 0)
         if key == "Analyst consensus": pass_map[key] = bool(value)
+        elif key == "RAAM": pass_map[key] = value is not None and (value >= threshold if is_long else value <= 100 - threshold)
         elif key in {"Insider cluster", "Institution net flow"}: pass_map[key] = value is not None and (value >= threshold if is_long else value <= -threshold)
         elif key in {"Margins positive", "Margins expanding"}: pass_map[key] = value is not None and value >= threshold
         else: pass_map[key] = value is not None and (value >= threshold if is_long else value <= -threshold)
     score = sum(10 for ok in pass_map.values() if ok)
-    return {"Symbol": symbol, "Score": score, "Max": 130, "Price": price, "Target gap %": target_gap, "Revenue yoy %": metrics.get("revenue_yoy"), "EPS yoy %": metrics.get("eps_yoy"), "FCF growth %": metrics.get("fcf_yoy"), "FCF yoy %": metrics.get("fcf_yoy"), "Operating margin %": metrics.get("operating_margin"), "Margins %": metrics.get("operating_margin"), "Insider 90d $": tests["Insider cluster"], "Finviz Insider Trans %": extra.get("finviz_insider_trans"), "Clenow Momentum": momentum, "Recommendation": extra.get("consensus_key") or extra.get("recommendation", "NA"), "Direction": direction, "Metrics": metrics, "Extra": extra, "Criteria": pass_map}
+    return {"Symbol": symbol, "Score": score, "Max": 140, "Price": price, "Target gap %": target_gap, "Revenue yoy %": metrics.get("revenue_yoy"), "EPS yoy %": metrics.get("eps_yoy"), "FCF growth %": metrics.get("fcf_yoy"), "FCF yoy %": metrics.get("fcf_yoy"), "Operating margin %": metrics.get("operating_margin"), "Margins %": metrics.get("operating_margin"), "Insider 90d $": tests["Insider cluster"], "Finviz Insider Trans %": extra.get("finviz_insider_trans"), "Clenow Momentum": momentum, "RAAM": raam, "Recommendation": extra.get("consensus_key") or extra.get("recommendation", "NA"), "Direction": direction, "Metrics": metrics, "Extra": extra, "Criteria": pass_map}
 
 
 def tech_flags(frame: pd.DataFrame, direction: str) -> dict[str, Any]:
@@ -487,6 +512,7 @@ def statement_frame(metrics: dict[str, Any], annual: bool = True) -> pd.DataFram
     if not grouped: return pd.DataFrame()
     values = pd.DataFrame(grouped).T.reindex(sorted(set().union(*(s.index for s in grouped.values())), key=str), axis=1)
     output: dict[str, pd.Series] = {}
+    section_short = {"Income statement": "I/S", "Balance sheet": "B/S", "Statement of cash flow": "C/F"}
     for section, label, _ in STATEMENT_LINES:
         line = values.loc[label] if label in values.index else pd.Series(np.nan, index=values.columns, dtype=float)
         if label.endswith("Margin %") or label == "EPS":
@@ -497,8 +523,9 @@ def statement_frame(metrics: dict[str, Any], annual: bool = True) -> pd.DataFram
         else:
             display_label = f"{label} ($mm)"
             line = line / 1_000_000
-        output[f"{section} · {display_label}"] = line
-        output[f"{section} · {display_label} YoY %"] = line.pct_change(periods=1 if annual else 4) * 100
+        short_section = section_short.get(section, section)
+        output[f"{short_section} · {display_label}"] = line
+        output[f"{short_section} · {display_label} YoY %"] = line.pct_change(periods=1 if annual else 4) * 100
     result = pd.DataFrame(output).T
     result.columns = [str(c) for c in result.columns]
     return result
@@ -527,7 +554,7 @@ def peer_metric_frame(symbols: list[str], line: str, annual: bool = True) -> pd.
 def closest_peers(symbol: str) -> list[str]:
     """Use the provider industry label as a GICS-subindustry fallback, ranked by market cap."""
     target = enrichment(symbol)
-    candidates = list(dict.fromkeys(TOP_MARKET_CAP_DEFAULT + DEFAULT_UNIVERSE))
+    candidates = list(dict.fromkeys(PEER_CANDIDATES + TOP_MARKET_CAP_DEFAULT + DEFAULT_UNIVERSE))
     rows = []
     for candidate in candidates:
         if candidate == symbol: continue
@@ -560,7 +587,7 @@ def style_financial_table(frame: pd.DataFrame, peer_frames: list[pd.DataFrame] |
     valid_peer_frames = [p for p in peer_frames if isinstance(p, pd.DataFrame) and not p.empty]
     peer_yoy = pd.concat(valid_peer_frames, axis=0) if valid_peer_frames else pd.DataFrame()
     def style(data: pd.DataFrame):
-        out = pd.DataFrame("background-color: transparent;", index=data.index, columns=data.columns)
+        out = pd.DataFrame("background-color: #ffffff; color: #111827;", index=data.index, columns=data.columns)
         for idx in data.index:
             label = str(idx)
             if "YoY %" in label:
@@ -569,7 +596,7 @@ def style_financial_table(frame: pd.DataFrame, peer_frames: list[pd.DataFrame] |
                 out.loc[idx, :] = out.loc[idx, :].map(lambda current: f"{current} font-weight: 700;" if current else "font-weight: 700;")
             elif "YoY %" not in label:
                 out.loc[idx, :] = out.loc[idx, :].map(lambda current: f"{current} padding-left: 18px;" if current else "padding-left: 18px;")
-            if label.startswith("Income statement") and "Revenue" in label or label.startswith("Balance sheet") and "Cash" in label or label.startswith("Statement of cash flow") and "Net income" in label:
+            if label.startswith("I/S") and "Revenue" in label or label.startswith("B/S") and "Cash" in label or label.startswith("C/F") and "Net income" in label:
                 out.loc[idx, :] = out.loc[idx, :].map(lambda current: f"{current} border-top: 2px solid #475569;" if current else "border-top: 2px solid #475569;")
             if "YoY %" not in str(idx): continue
             for col in data.columns:
@@ -588,7 +615,7 @@ def style_screener_table(frame: pd.DataFrame, records: list[dict[str, Any]]):
     if frame.empty: return frame
     by_symbol = {record["Symbol"]: record for record in records}
     green = "background-color: #effaf0"
-    mapping = {"Revenue growth": "Revenue yoy %", "EPS growth": "EPS yoy %", "FCF growth": "FCF yoy %", "Margins positive": "Operating margin %", "Analyst consensus": "Analyst Consensus", "Price target gap": "Target gap %", "Insider cluster": "Insider 90d $", "Clenow momentum": "Clenow Momentum"}
+    mapping = {"Revenue growth": "Revenue yoy %", "EPS growth": "EPS yoy %", "FCF growth": "FCF yoy %", "Margins positive": "Operating margin %", "Analyst consensus": "Analyst Consensus", "Price target gap": "Target gap %", "Insider cluster": "Insider 90d $", "Clenow momentum": "Clenow Momentum", "RAAM": "RAAM"}
     def style(data: pd.DataFrame):
         out = pd.DataFrame("", index=data.index, columns=data.columns)
         for row_index, row in data.iterrows():
@@ -602,7 +629,7 @@ def style_screener_table(frame: pd.DataFrame, records: list[dict[str, Any]]):
         if value is None or (isinstance(value, float) and np.isnan(value)): return "NA"
         try: return f"{float(str(value).replace('%', '').replace(',', '')):.1f}"
         except (TypeError, ValueError): return str(value)
-    formatters = {column: safe_one_decimal for column in formatted.columns if "%" in str(column) or "Momentum" in str(column)}
+    formatters = {column: safe_one_decimal for column in formatted.columns if "%" in str(column) or "Momentum" in str(column) or str(column) == "RAAM"}
     return formatted.style.apply(style, axis=None).format(formatters)
 
 
@@ -692,9 +719,10 @@ def main() -> None:
         st.caption("Primary sources: SEC Company Facts and filings. Market/analyst enrichment: Yahoo Finance.")
         st.divider(); st.header("Screen thresholds")
         with st.form("screen_form"):
-            thresholds = {"Revenue growth": st.slider("Revenue growth YoY %", -50, 100, 15 if direction == "Long" else -15), "EPS growth": st.slider("EPS growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Earnings beats": st.slider("Earnings beats, past year", 0, 4, 3), "FCF growth": st.slider("FCF growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Margins positive": st.slider("Operating margin %", -50, 50, 0), "Margins expanding": st.slider("Margin expansion YoY pts", -50, 50, 0), "Buy share trend": st.slider("Buy recommendation change pts", -100, 100, 0), "Target trend": st.slider("Target change YoY %", -100, 200, 0), "Price target gap": st.slider("Price target gap %", -100, 200, 15 if direction == "Long" else -15), "Insider cluster": st.slider("Insider cluster / 90d $", 0, 10_000_000, 0), "Institution net flow": st.slider("Institution net flow $", -10_000_000, 10_000_000, 0), "Clenow momentum": st.slider("Clenow Momentum %", -100, 500, 0 if direction == "Long" else 0)}
-            min_score = st.slider("Minimum score to show", 0, 130, 60, step=10)
+            thresholds = {"Revenue growth": st.slider("Revenue growth YoY %", -50, 100, 15 if direction == "Long" else -15), "EPS growth": st.slider("EPS growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Earnings beats": st.slider("Earnings beats, past year", 0, 4, 3), "FCF growth": st.slider("FCF growth YoY %", -100, 100, 15 if direction == "Long" else -15), "Margins positive": st.slider("Operating margin %", -50, 50, 0), "Margins expanding": st.slider("Margin expansion YoY pts", -50, 50, 0), "Buy share trend": st.slider("Buy recommendation change pts", -100, 100, 0), "Target trend": st.slider("Target change YoY %", -100, 200, 0), "Price target gap": st.slider("Price target gap %", -100, 200, 15 if direction == "Long" else -15), "Insider cluster": st.slider("Insider cluster / 90d $", 0, 10_000_000, 0), "Institution net flow": st.slider("Institution net flow $", -10_000_000, 10_000_000, 0), "Clenow momentum": st.slider("Clenow Momentum %", -100, 500, 0 if direction == "Long" else 0), "RAAM": st.slider("RAAM", 0, 100, 50)}
+            min_score = st.slider("Minimum score to show", 0, 140, 60, step=10)
             scan = st.form_submit_button("Scan universe", type="primary", use_container_width=True)
+        st.caption("RAAM is a transparent approximation using Gioele Giordano's published pillars: absolute momentum, volatility, correlation, and trend/breakout.")
     if scan:
         manual_symbols = parse_symbol_list(manual_text) if use_manual else []
         if not selected and not manual_symbols and not scan_all:
@@ -730,10 +758,10 @@ def main() -> None:
             display["At EMA/support"] = display.Symbol.map({r["Symbol"]: r["Technical"].get("near_level", False) for r in filtered_records})
             display["Trend"] = display.Symbol.map({r["Symbol"]: r["Technical"].get("trend", "NA") for r in filtered_records})
             display["2× volume"] = display.Symbol.map({r["Symbol"]: r["Technical"].get("high_volume", False) for r in filtered_records})
-        columns = ["Symbol", "Score", "Max", "GICS Industry", "Marketplace", "Current Price", "Analyst Consensus", "Revenue yoy %", "EPS yoy %", "FCF yoy %", "Operating margin %", "Target gap %", "Insider 90d $", "Finviz Insider Trans %", "Clenow Momentum", "At EMA/support", "Trend", "2× volume"]
+        columns = ["Symbol", "Score", "Max", "GICS Industry", "Marketplace", "Current Price", "Analyst Consensus", "Revenue yoy %", "EPS yoy %", "FCF yoy %", "Operating margin %", "Target gap %", "Insider 90d $", "Finviz Insider Trans %", "Clenow Momentum", "RAAM", "At EMA/support", "Trend", "2× volume"]
         st.dataframe(style_screener_table(display[columns] if not display.empty else pd.DataFrame(columns=columns), filtered_records), use_container_width=True, hide_index=True)
         st.caption(f"{len(filtered_records)} of {len(records)} scanned symbols meet the {config['min_score']}-point minimum. Margins % is operating margin. Each satisfied criterion contributes 10 points; NA data is neutral.")
-        st.caption("Each of 12 criteria contributes 10 points. NA data is neutral; inspect source coverage before acting. Earnings surprises, Form 4 clusters, and 13F flow require a filing parser or licensed feed when Yahoo does not expose them.")
+        st.caption("Each of 14 criteria contributes 10 points. NA data is neutral; inspect source coverage before acting. Earnings surprises, Form 4 clusters, and 13F flow require a filing parser or licensed feed when Yahoo does not expose them.")
         cols = st.columns(3)
         for col, title, keys in zip(cols, ["Fundamentals", "Valuation", "Insider activity"], [["Revenue yoy %", "EPS yoy %", "FCF yoy %", "Operating margin %"], ["Analyst Consensus", "Target gap %"], ["Insider 90d $", "Clenow Momentum"]]):
             with col:
