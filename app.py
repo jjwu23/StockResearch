@@ -42,6 +42,11 @@ def fmt(value: Any, suffix: str = "") -> str:
     return f"{value:,.2f}{suffix}"
 
 
+def change_label(value: Any, period: str) -> str:
+    value = pct(value)
+    return f"{value:+.1f}% vs {period}" if value is not None else f"NA vs {period}"
+
+
 def parse_symbol_list(text: str) -> list[str]:
     """Accept comma/space/newline/tab-separated symbols and pasted table text."""
     tokens = re.findall(r"(?<![A-Z0-9])([A-Z]{1,5}(?:[-.][A-Z]{1,2})?)(?![A-Z0-9])", text.upper())
@@ -275,7 +280,7 @@ def enrichment(symbol: str) -> dict[str, Any]:
         consensus_key = "buy" if rec_number <= 2.0 else "hold" if rec_number <= 3.0 else "sell"
     except (TypeError, ValueError):
         consensus_key = str(recommendation).lower().replace(" ", "_") if recommendation else None
-    info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": recommendation, "consensus_key": consensus_key, "sector": raw.get("sector") or fallback.get("Sector"), "industry": raw.get("industry") or fallback.get("Industry"), "gics_industry": raw.get("industry") or fallback.get("Industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange") or fallback.get("Exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None, "last_earnings": None, "next_earnings": None, "cash": raw.get("totalCash"), "debt": raw.get("totalDebt"), "finviz_insider_trans": fallback.get("Insider Trans"), "valuation": {"P/E": raw.get("trailingPE") or fallback.get("P/E"), "P/S": raw.get("priceToSalesTrailing12Months") or fallback.get("P/S"), "PEG": raw.get("pegRatio") or fallback.get("PEG"), "P/OCF": None, "P/FCF": raw.get("priceToFreeCashflow") or fallback.get("P/FCF"), "P/B": raw.get("priceToBook") or fallback.get("P/B"), "P/TBV": None}})
+    info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "target_low": raw.get("targetLowPrice"), "target_high": raw.get("targetHighPrice"), "target_1m_change": raw.get("targetMeanPriceChange1m"), "target_3m_change": raw.get("targetMeanPriceChange3m"), "target_low_1m_change": raw.get("targetLowPriceChange1m"), "target_low_3m_change": raw.get("targetLowPriceChange3m"), "target_high_1m_change": raw.get("targetHighPriceChange1m"), "target_high_3m_change": raw.get("targetHighPriceChange3m"), "recommendation": recommendation, "consensus_key": consensus_key, "sector": raw.get("sector") or fallback.get("Sector"), "industry": raw.get("industry") or fallback.get("Industry"), "gics_industry": raw.get("industry") or fallback.get("Industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange") or fallback.get("Exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None, "last_earnings": None, "next_earnings": None, "cash": raw.get("totalCash"), "debt": raw.get("totalDebt"), "finviz_insider_trans": fallback.get("Insider Trans"), "valuation": {"P/E": raw.get("trailingPE") or fallback.get("P/E"), "P/S": raw.get("priceToSalesTrailing12Months") or fallback.get("P/S"), "PEG": raw.get("pegRatio") or fallback.get("PEG"), "P/OCF": None, "P/FCF": raw.get("priceToFreeCashflow") or fallback.get("P/FCF"), "P/B": raw.get("priceToBook") or fallback.get("P/B"), "P/TBV": None}})
     try:
         quote = prices(symbol, "1mo")
         # Use the latest completed daily close for the screener snapshot.
@@ -296,6 +301,14 @@ def enrichment(symbol: str) -> dict[str, Any]:
         except ValueError: pass
     if not info.get("summary"):
         info["summary"] = f"{symbol} is classified in the {info.get('industry') or 'unavailable'} industry and trades on {info.get('marketplace') or 'an unavailable marketplace'}."
+    try:
+        target_data = ticker.analyst_price_targets
+        if isinstance(target_data, dict):
+            info["target"] = info.get("target") or target_data.get("current") or target_data.get("mean")
+            info["target_low"] = info.get("target_low") or target_data.get("low")
+            info["target_high"] = info.get("target_high") or target_data.get("high")
+    except Exception:
+        pass
     try:
         rec = ticker.recommendations
         info["buy_share"] = ((rec["strongBuy"] + rec["buy"]).tail(4).sum() / rec.tail(4)[["strongBuy", "buy", "hold", "sell", "strongSell"]].sum().sum() * 100) if rec is not None and not rec.empty and "strongBuy" in rec else None
@@ -326,6 +339,7 @@ def enrichment(symbol: str) -> dict[str, Any]:
             info["insider_90d"] = None
     except Exception:
         info["insider_90d"] = None
+    info["iv_stats"] = implied_volatility_stats(symbol, info.get("price"))
     return info
 
 
@@ -400,6 +414,67 @@ def analyst_actions(symbol: str) -> pd.DataFrame:
         return frame.sort_values("Date")
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def implied_volatility_stats(symbol: str, current_price: float | None) -> dict[str, float | None]:
+    if not current_price: return {"iv": None, "one_sigma_pct": None, "one_sigma_move": None, "iv_percentile": None}
+    iv = None
+    try:
+        ticker = yf.Ticker(symbol)
+        expiries = [pd.Timestamp(exp) for exp in ticker.options]
+        target_expiry = min((exp for exp in expiries if 180 <= (exp - pd.Timestamp.today()).days <= 450), key=lambda exp: abs((exp - pd.Timestamp.today()).days - 365), default=None)
+        if target_expiry is not None:
+            chain = ticker.option_chain(target_expiry.strftime("%Y-%m-%d"))
+            calls = chain.calls; puts = chain.puts
+            candidates = pd.concat([calls, puts], ignore_index=True) if calls is not None and puts is not None else pd.DataFrame()
+            if not candidates.empty and "impliedVolatility" in candidates:
+                atm = candidates.iloc[(pd.to_numeric(candidates["strike"], errors="coerce") - current_price).abs().argsort()[:4]]
+                iv = float(pd.to_numeric(atm["impliedVolatility"], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna().mean())
+    except Exception:
+        pass
+    if iv is None:
+        try: iv = float(yf.Ticker(symbol).info.get("impliedVolatility"))
+        except Exception: iv = None
+    percentile = None
+    try:
+        history = prices(symbol, "2y"); realized = history["Close"].pct_change().rolling(21).std() * np.sqrt(252)
+        if iv is not None and realized.dropna().tail(252).size: percentile = float((realized.dropna().tail(252) < iv).mean() * 100)
+    except Exception:
+        pass
+    return {"iv": iv, "one_sigma_pct": iv * 100 if iv is not None else None, "one_sigma_move": current_price * iv if iv is not None else None, "iv_percentile": percentile}
+
+
+def normalize_analyst_actions(frame: pd.DataFrame) -> pd.DataFrame:
+    if frame.empty: return frame
+    result = frame.copy()
+    def action(row: pd.Series) -> str:
+        text = " ".join(str(row.get(column, "")) for column in ["Action", "To Grade", "From Grade"]).lower()
+        if "init" in text: return "Initiate"
+        if "down" in text or "sell" in text or "underperform" in text: return "Downgrade"
+        if "up" in text or "buy" in text or "overweight" in text: return "Upgrade"
+        return "Maintain"
+    result["Action"] = result.apply(action, axis=1)
+    to_target = next((column for column in ["To Target", "To Price Target", "Price Target"] if column in result.columns), None)
+    from_target = next((column for column in ["From Target", "From Price Target"] if column in result.columns), None)
+    if to_target or from_target:
+        result["Price target change"] = result.apply(lambda row: f"from ${row.get(from_target):,.2f} to ${row.get(to_target):,.2f}" if from_target and to_target and pd.notna(row.get(from_target)) and pd.notna(row.get(to_target)) else f"to ${row.get(to_target):,.2f}" if to_target and pd.notna(row.get(to_target)) else "NA", axis=1)
+    else:
+        result["Price target change"] = "NA"
+    return result
+
+
+def style_insider_table(frame: pd.DataFrame, market_cap: float | None):
+    if frame.empty: return frame
+    result = frame.copy()
+    for column in ["Buy volume", "Sell volume"]:
+        if column in result.columns:
+            result[f"{column} % market cap"] = pd.to_numeric(result[column], errors="coerce") / market_cap * 100 if market_cap else np.nan
+    dollar_columns = [column for column in result.columns if column in {"Buy volume", "Sell volume"} or "Value" in str(column) or "Amount" in str(column)]
+    percent_columns = [column for column in result.columns if "% market cap" in str(column)]
+    formatters = {column: (lambda value: "NA" if pd.isna(value) else f"${float(value):,.0f}") for column in dollar_columns}
+    formatters.update({column: (lambda value: "NA" if pd.isna(value) else f"{float(value):.2f}%") for column in percent_columns})
+    return result.style.format(formatters)
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -794,15 +869,30 @@ def main() -> None:
         dcf_default = default_dcf_price(metrics, extra); consensus_target = extra.get("target"); current_price = extra.get("price")
         dcf_upside = dcf_default / current_price - 1 if dcf_default and current_price else None
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
+        consensus_low = extra.get("target_low"); consensus_high = extra.get("target_high")
+        low_upside = consensus_low / current_price - 1 if consensus_low and current_price else None
+        high_upside = consensus_high / current_price - 1 if consensus_high and current_price else None
+        iv_stats = extra.get("iv_stats", {})
         cap_mm = extra.get("market_cap") / 1_000_000 if extra.get("market_cap") else None
         a, b, c, d = st.columns(4)
         a.metric("Market cap ($mm)", f"{cap_mm:,.1f}" if cap_mm is not None else "NA"); b.metric("Stock price", fmt(current_price)); c.metric("GICS industry", extra.get("gics_industry") or "NA"); d.metric("Marketplace", extra.get("marketplace") or "NA")
         a, b, c, d = st.columns(4)
-        a.metric("Analyst consensus", str(extra.get("consensus_key") or extra.get("recommendation") or "NA").replace("_", " ").title()); b.metric("Analyst price target", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); c.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); d.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA")
+        with a: st.metric("Analyst consensus", str(extra.get("consensus_key") or extra.get("recommendation") or "NA").replace("_", " ").title())
+        with b:
+            st.metric("Analyst price target", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA")
+            st.caption(f"{change_label(extra.get('target_1m_change'), '1M')} · {change_label(extra.get('target_3m_change'), '3M')}")
+        with c:
+            st.metric("Consensus low", fmt(consensus_low), f"{low_upside:.1%} vs current" if low_upside is not None else "NA")
+            st.caption(f"{change_label(extra.get('target_low_1m_change'), '1M')} · {change_label(extra.get('target_low_3m_change'), '3M')}")
+        with d:
+            st.metric("Consensus high", fmt(consensus_high), f"{high_upside:.1%} vs current" if high_upside is not None else "NA")
+            st.caption(f"{change_label(extra.get('target_high_1m_change'), '1M')} · {change_label(extra.get('target_high_3m_change'), '3M')}")
         a, b, c, d = st.columns(4)
-        a.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA"); b.metric("PEG ratio", fmt(peg_ratio)); c.metric("Last earnings", extra.get("last_earnings") or "NA"); d.metric("Next earnings", extra.get("next_earnings") or "NA")
+        a.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); b.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA"); c.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA"); d.metric("PEG ratio", fmt(peg_ratio))
         peg_label = "Good" if peg_ratio is not None and 0 < peg_ratio < 1 else "Fair" if peg_ratio is not None and abs(peg_ratio - 1) <= .15 else "Bad/Expensive" if peg_ratio is not None and peg_ratio > 1 else "Red Flag" if peg_ratio is not None and peg_ratio < 0 else "NA"
         st.caption(f"PEG interpretation: **{peg_label}** — Good (<1.0) means inexpensive for growth; Fair (around 1.0) means fairly priced; Bad/Expensive (>1.0) means expensive for expected growth; Red Flag (negative) means losses or shrinking growth.")
+        a, b, c, d = st.columns(4)
+        a.metric("Last earnings", extra.get("last_earnings") or "NA"); b.metric("Next earnings", extra.get("next_earnings") or "NA"); c.metric("Implied volatility (1σ)", f"±{iv_stats.get('one_sigma_pct'):.1f}%" if iv_stats.get("one_sigma_pct") is not None else "NA", f"±${iv_stats.get('one_sigma_move'):,.2f}" if iv_stats.get("one_sigma_move") is not None else "NA"); d.metric("IV percentile", f"{iv_stats.get('iv_percentile'):.1f}%" if iv_stats.get("iv_percentile") is not None else "NA", "of past-year days below current IV")
         chart_frame = prices(symbol, "2y")
         if not chart_frame.empty:
             st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
@@ -872,19 +962,19 @@ def main() -> None:
         openinsider = openinsider_table(symbol)
         if not openinsider.empty:
             st.caption("Source: OpenInsider")
-            st.dataframe(openinsider, use_container_width=True, hide_index=True)
+            st.dataframe(style_insider_table(openinsider, extra.get("market_cap")), use_container_width=True, hide_index=True)
         else:
             insider_table = insider_trades(symbol)
             st.caption("OpenInsider was unavailable; using the available Yahoo Finance insider feed.")
-            st.dataframe(insider_table.sort_values("Date", ascending=False) if not insider_table.empty else pd.DataFrame({"Date": [], "Buy volume": [], "Sell volume": []}), use_container_width=True, hide_index=True)
+            st.dataframe(style_insider_table(insider_table.sort_values("Date", ascending=False) if not insider_table.empty else pd.DataFrame({"Date": [], "Buy volume": [], "Sell volume": []}), extra.get("market_cap")), use_container_width=True, hide_index=True)
         st.markdown("**Earnings and analyst actions**")
         earnings_table = earnings_history(symbol)
         if not earnings_table.empty:
             keep = [column for column in ["Date", "Reported EPS", "EPS Estimate", "Surprise(%)"] if column in earnings_table.columns]
             st.dataframe(earnings_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-        actions_table = analyst_actions(symbol)
+        actions_table = normalize_analyst_actions(analyst_actions(symbol))
         if not actions_table.empty:
-            keep = [column for column in ["Date", "Firm", "To Grade", "From Grade", "Action"] if column in actions_table.columns]
+            keep = [column for column in ["Date", "Firm", "Action", "To Grade", "From Grade", "Price target change"] if column in actions_table.columns]
             st.dataframe(actions_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
         marketwatch = marketwatch_tables(symbol)
         if marketwatch:
