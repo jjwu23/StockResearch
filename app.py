@@ -129,7 +129,8 @@ def sec_facts(symbol: str) -> dict[str, Any]:
 
 
 def fact_series(bundle: dict, names: list[str], unit: str = "USD") -> pd.Series:
-    for taxonomy in ["us-gaap", "dei"]:
+    taxonomies = ["us-gaap", "dei"] + [taxonomy for taxonomy in bundle.get("facts", {}) if taxonomy not in {"us-gaap", "dei"}]
+    for taxonomy in taxonomies:
         for name in names:
             node = bundle.get("facts", {}).get(taxonomy, {}).get(name, {})
             units = node.get("units", {})
@@ -220,7 +221,7 @@ def finviz_snapshot(symbol: str) -> dict[str, Any]:
         for table in tables:
             flat = table.astype(str).to_numpy().ravel().tolist()
             for i, value in enumerate(flat[:-1]):
-                if value in {"Recom", "Insider Trans", "Target Price", "Exchange", "Earnings", "P/E", "P/S", "PEG", "P/FCF", "P/B"}:
+                if value in {"Recom", "Insider Trans", "Target Price", "Exchange", "Earnings", "P/E", "P/S", "PEG", "P/FCF", "P/B", "Industry", "Sector", "Market Cap", "Price"}:
                     pairs[value] = flat[i + 1]
         peer_section = re.search(r">Peers<.*?(?:Held by|Scroll to Statements)", html, flags=re.I | re.S)
         peer_html = peer_section.group(0) if peer_section else ""
@@ -252,11 +253,12 @@ def enrichment(symbol: str) -> dict[str, Any]:
         consensus_key = "buy" if rec_number <= 2.0 else "hold" if rec_number <= 3.0 else "sell"
     except (TypeError, ValueError):
         consensus_key = str(recommendation).lower().replace(" ", "_") if recommendation else None
-    info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": recommendation, "consensus_key": consensus_key, "sector": raw.get("sector"), "industry": raw.get("industry"), "gics_industry": raw.get("industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange") or fallback.get("Exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None, "last_earnings": None, "next_earnings": None, "cash": raw.get("totalCash"), "debt": raw.get("totalDebt"), "finviz_insider_trans": fallback.get("Insider Trans"), "valuation": {"P/E": raw.get("trailingPE") or fallback.get("P/E"), "P/S": raw.get("priceToSalesTrailing12Months") or fallback.get("P/S"), "PEG": raw.get("pegRatio") or fallback.get("PEG"), "P/OCF": None, "P/FCF": raw.get("priceToFreeCashflow") or fallback.get("P/FCF"), "P/B": raw.get("priceToBook") or fallback.get("P/B"), "P/TBV": None}})
+    info.update({"price": raw.get("currentPrice") or raw.get("regularMarketPrice"), "target": raw.get("targetMeanPrice"), "recommendation": recommendation, "consensus_key": consensus_key, "sector": raw.get("sector") or fallback.get("Sector"), "industry": raw.get("industry") or fallback.get("Industry"), "gics_industry": raw.get("industry") or fallback.get("Industry"), "marketplace": raw.get("fullExchangeName") or raw.get("exchange") or fallback.get("Exchange"), "market_cap": raw.get("marketCap"), "summary": raw.get("longBusinessSummary"), "analyst_growth": raw.get("revenueGrowth") or raw.get("earningsGrowth"), "guidance": None, "last_earnings": None, "next_earnings": None, "cash": raw.get("totalCash"), "debt": raw.get("totalDebt"), "finviz_insider_trans": fallback.get("Insider Trans"), "valuation": {"P/E": raw.get("trailingPE") or fallback.get("P/E"), "P/S": raw.get("priceToSalesTrailing12Months") or fallback.get("P/S"), "PEG": raw.get("pegRatio") or fallback.get("PEG"), "P/OCF": None, "P/FCF": raw.get("priceToFreeCashflow") or fallback.get("P/FCF"), "P/B": raw.get("priceToBook") or fallback.get("P/B"), "P/TBV": None}})
     try:
         quote = prices(symbol, "1mo")
         # Use the latest completed daily close for the screener snapshot.
-        info["price"] = float(quote["Close"].iloc[-1]) if not quote.empty else info.get("price")
+        finviz_price = re.sub(r"[^0-9.-]", "", str(fallback.get("Price", "")))
+        info["price"] = float(quote["Close"].iloc[-1]) if not quote.empty else info.get("price") or (float(finviz_price) if finviz_price else None)
     except Exception:
         info["price"] = info.get("price")
     if not info.get("market_cap") and info.get("price"):
@@ -264,6 +266,14 @@ def enrichment(symbol: str) -> dict[str, Any]:
             info["market_cap"] = float(ticker.fast_info.get("market_cap"))
         except Exception:
             pass
+    if not info.get("market_cap") and fallback.get("Market Cap"):
+        match = re.match(r"([\d.]+)([BM])", str(fallback["Market Cap"]).replace(",", ""), flags=re.I)
+        if match: info["market_cap"] = float(match.group(1)) * (1_000_000_000 if match.group(2).upper() == "B" else 1_000_000)
+    if not info.get("target") and fallback.get("Target Price"):
+        try: info["target"] = float(str(fallback["Target Price"]).replace("$", "").replace(",", ""))
+        except ValueError: pass
+    if not info.get("summary"):
+        info["summary"] = f"{symbol} is classified in the {info.get('industry') or 'unavailable'} industry and trades on {info.get('marketplace') or 'an unavailable marketplace'}."
     try:
         rec = ticker.recommendations
         info["buy_share"] = ((rec["strongBuy"] + rec["buy"]).tail(4).sum() / rec.tail(4)[["strongBuy", "buy", "hold", "sell", "strongSell"]].sum().sum() * 100) if rec is not None and not rec.empty and "strongBuy" in rec else None
@@ -367,6 +377,26 @@ def analyst_actions(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def openinsider_table(symbol: str) -> pd.DataFrame:
+    try:
+        tables = pd.read_html(f"https://openinsider.com/search?q={symbol.lower()}")
+        for table in tables:
+            if any("Trade" in str(column) or "Price" in str(column) for column in table.columns): return table
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def marketwatch_tables(symbol: str) -> list[pd.DataFrame]:
+    try:
+        tables = pd.read_html(f"https://www.marketwatch.com/investing/stock/{symbol.lower()}/analystestimates")
+        return [table for table in tables if not table.empty]
+    except Exception:
+        return []
+
+
 def chart(symbol: str, frame: pd.DataFrame, direction: str, insider_value: Any) -> go.Figure:
     t = tech_flags(frame, direction); fig = make_subplots(specs=[[{"secondary_y": True}]])
     fig.add_trace(go.Candlestick(x=frame.index, open=frame.Open, high=frame.High, low=frame.Low, close=frame.Close, name=symbol, hovertemplate="%{x|%Y-%m-%d}<br>Open %{open:.2f}<br>High %{high:.2f}<br>Low %{low:.2f}<br>Close %{close:.2f}<extra></extra>"))
@@ -380,13 +410,22 @@ def chart(symbol: str, frame: pd.DataFrame, direction: str, insider_value: Any) 
     trades = insider_trades(symbol)
     if not trades.empty:
         visible = trades[trades.Date >= frame.index.min()]
-        fig.add_trace(go.Bar(x=visible.Date, y=visible["Buy volume"], name="Insider purchases", marker_color="#2ca02c", opacity=.55, hovertemplate="Buy volume: $%{y:,.0f}<extra></extra>"), secondary_y=True)
-        fig.add_trace(go.Bar(x=visible.Date, y=-visible["Sell volume"], name="Insider sales", marker_color="#d62728", opacity=.55, hovertemplate="Sale volume: $%{customdata:,.0f}<extra></extra>", customdata=visible["Sell volume"]), secondary_y=True)
+        marker_y = float(frame.High.max()) * 1.04
+        if visible["Buy volume"].sum() > 0:
+            buys = visible[visible["Buy volume"] > 0]
+            fig.add_trace(go.Scatter(x=buys.Date, y=[marker_y] * len(buys), name="Insider purchases", mode="markers", marker={"color": "#22c55e", "symbol": "triangle-up", "size": 10}, customdata=buys[["Buy volume", "Buy shares"]], hovertemplate="%{x|%Y-%m-%d}<br>Purchase volume $%{customdata[0]:,.0f}<br>Shares %{customdata[1]:,.0f}<extra></extra>"))
+        if visible["Sell volume"].sum() > 0:
+            sales = visible[visible["Sell volume"] > 0]
+            fig.add_trace(go.Scatter(x=sales.Date, y=[marker_y] * len(sales), name="Insider sales", mode="markers", marker={"color": "#ef4444", "symbol": "triangle-down", "size": 10}, customdata=sales[["Sell volume", "Sell shares"]], hovertemplate="%{x|%Y-%m-%d}<br>Sale volume $%{customdata[0]:,.0f}<br>Shares %{customdata[1]:,.0f}<extra></extra>"))
     earnings = earnings_history(symbol)
     if not earnings.empty:
         for _, event in earnings.iterrows():
             if pd.notna(event.Date) and frame.index.min() <= event.Date <= frame.index.max():
-                fig.add_vline(x=event.Date, line_color="rgba(80,220,120,.6)", line_dash="dot", annotation_text="EPS", annotation_position="top")
+                surprise = event.get("Surprise(%)") if hasattr(event, "get") else None
+                try: surprise_value = float(surprise)
+                except (TypeError, ValueError): surprise_value = 0.0
+                bottom_y = float(frame.Low.min()) * .96
+                fig.add_trace(go.Scatter(x=[event.Date], y=[bottom_y], name="Positive earnings surprise" if surprise_value >= 0 else "Negative earnings surprise", mode="markers", marker={"color": "#22c55e" if surprise_value >= 0 else "#ef4444", "symbol": "circle", "size": 9}, customdata=[[event.get("Reported EPS"), event.get("EPS Estimate"), surprise]], hovertemplate="%{x|%Y-%m-%d}<br>Reported EPS %{customdata[0]}<br>EPS estimate %{customdata[1]}<br>Surprise %{customdata[2]}<extra></extra>"))
     actions = analyst_actions(symbol)
     if not actions.empty:
         for _, event in actions.tail(12).iterrows():
@@ -690,24 +729,24 @@ def main() -> None:
         if not default_peer_list: default_peer_list = closest_peers(symbol)
         multiple_targets = multiple_price_targets(metrics, extra, default_peer_list)
         peer_valuation = valuation_frame(default_peer_list)
-        peer_average_summary = "NA"
-        if not peer_valuation.empty and "Peer average" in peer_valuation.Company.values:
-            avg = peer_valuation[peer_valuation.Company == "Peer average"].iloc[0]
-            peer_average_summary = " · ".join(f"{key} {avg[key]:.1f}x" for key in ["P/S", "P/E", "PEG", "P/OCF", "P/FCF", "P/B", "P/TBV"] if pd.notna(avg[key]))
         dcf_default = default_dcf_price(metrics, extra); consensus_target = extra.get("target"); current_price = extra.get("price")
         dcf_upside = dcf_default / current_price - 1 if dcf_default and current_price else None
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
-        a, b, c, d = st.columns(4)
         cap_mm = extra.get("market_cap") / 1_000_000 if extra.get("market_cap") else None
-        a.metric("Market cap ($mm)", f"{cap_mm:,.1f}" if cap_mm is not None else "NA"); b.metric("Stock price", fmt(current_price)); c.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); d.metric("Analyst consensus", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA")
         a, b, c, d = st.columns(4)
-        a.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA"); b.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA"); c.metric("Price per PEG ratio", fmt(multiple_targets["Price/PEG"]), f"{multiple_targets['Price/PEG'] / current_price - 1:.1%} vs current" if multiple_targets["Price/PEG"] and current_price else "NA"); d.metric("Peer average valuation", peer_average_summary)
+        a.metric("Market cap ($mm)", f"{cap_mm:,.1f}" if cap_mm is not None else "NA"); b.metric("Stock price", fmt(current_price)); c.metric("GICS industry", extra.get("gics_industry") or "NA"); d.metric("Marketplace", extra.get("marketplace") or "NA")
         a, b, c, d = st.columns(4)
-        a.metric("Last earnings", extra.get("last_earnings") or "NA"); b.metric("Next earnings", extra.get("next_earnings") or "NA"); c.metric("GICS industry", extra.get("gics_industry") or "NA"); d.metric("Marketplace", extra.get("marketplace") or "NA")
+        a.metric("Analyst consensus", str(extra.get("consensus_key") or extra.get("recommendation") or "NA").replace("_", " ").title()); b.metric("Analyst price target", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); c.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA"); d.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA")
+        a, b, c, d = st.columns(4)
+        a.metric("Price per PEG ratio", fmt(multiple_targets["Price/PEG"]), f"{multiple_targets['Price/PEG'] / current_price - 1:.1%} vs current" if multiple_targets["Price/PEG"] and current_price else "NA"); b.metric("Last earnings", extra.get("last_earnings") or "NA"); c.metric("Next earnings", extra.get("next_earnings") or "NA"); d.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA")
         st.markdown("**Reported financials (SEC XBRL facts)**")
         annual_view = st.radio("Reporting period", ["Annual", "Quarterly"], horizontal=True, key="reporting_period") == "Annual"
         company_table = statement_frame(metrics, annual=annual_view)
-        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", value=", ".join(default_peer_list)).split(",") if p.strip() and p.strip().upper() != symbol][:4]
+        peer_signature = f"{symbol}:{peer_source}"
+        if st.session_state.get("peer_signature") != peer_signature:
+            st.session_state["peer_signature"] = peer_signature
+            st.session_state["peer_input"] = ", ".join(default_peer_list)
+        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", key="peer_input").split(",") if p.strip() and p.strip().upper() != symbol][:4]
         peer_tables = [statement_frame(filing_metrics(peer), annual=annual_view) for peer in peers]
         st.markdown("**Reported financials — selected stock**")
         st.dataframe(style_financial_table(company_table, peer_tables), use_container_width=True)
@@ -771,8 +810,14 @@ def main() -> None:
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
         st.caption(f"Editable DCF output: {fmt(dcf_price)} per share. The headline DCF and analyst consensus metrics remain at the top of this tab.")
         st.markdown("**Insider transactions**")
-        insider_table = insider_trades(symbol)
-        st.dataframe(insider_table.sort_values("Date", ascending=False) if not insider_table.empty else pd.DataFrame({"Date": [], "Buy volume": [], "Sell volume": []}), use_container_width=True, hide_index=True)
+        openinsider = openinsider_table(symbol)
+        if not openinsider.empty:
+            st.caption("Source: OpenInsider")
+            st.dataframe(openinsider, use_container_width=True, hide_index=True)
+        else:
+            insider_table = insider_trades(symbol)
+            st.caption("OpenInsider was unavailable; using the available Yahoo Finance insider feed.")
+            st.dataframe(insider_table.sort_values("Date", ascending=False) if not insider_table.empty else pd.DataFrame({"Date": [], "Buy volume": [], "Sell volume": []}), use_container_width=True, hide_index=True)
         st.markdown("**Earnings and analyst actions**")
         earnings_table = earnings_history(symbol)
         if not earnings_table.empty:
@@ -782,6 +827,13 @@ def main() -> None:
         if not actions_table.empty:
             keep = [column for column in ["Date", "Firm", "To Grade", "From Grade", "Action"] if column in actions_table.columns]
             st.dataframe(actions_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
+        marketwatch = marketwatch_tables(symbol)
+        if marketwatch:
+            st.markdown("**MarketWatch EPS estimate trends and analyst tables**")
+            for index, table in enumerate(marketwatch):
+                text = " ".join(str(column) for column in table.columns).lower()
+                if any(token in text for token in ["estimate", "analyst", "consensus", "surprise"]):
+                    st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
