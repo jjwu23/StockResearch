@@ -428,9 +428,17 @@ def chart(symbol: str, frame: pd.DataFrame, direction: str, insider_value: Any) 
                 fig.add_trace(go.Scatter(x=[event.Date], y=[bottom_y], name="Positive earnings surprise" if surprise_value >= 0 else "Negative earnings surprise", mode="markers", marker={"color": "#22c55e" if surprise_value >= 0 else "#ef4444", "symbol": "circle", "size": 9}, customdata=[[event.get("Reported EPS"), event.get("EPS Estimate"), surprise]], hovertemplate="%{x|%Y-%m-%d}<br>Reported EPS %{customdata[0]}<br>EPS estimate %{customdata[1]}<br>Surprise %{customdata[2]}<extra></extra>"))
     actions = analyst_actions(symbol)
     if not actions.empty:
+        bottom_y = float(frame.Low.min()) * .96
+        upgrades = []; downgrades = []
         for _, event in actions.tail(12).iterrows():
             if pd.notna(event.Date) and frame.index.min() <= event.Date <= frame.index.max():
-                fig.add_vline(x=event.Date, line_color="rgba(200,150,255,.55)", line_dash="dash", annotation_text="Analyst", annotation_position="bottom")
+                action_text = " ".join(str(event.get(column, "")) for column in ["Action", "To Grade", "From Grade"]).lower()
+                row = [event.Date, event.get("Firm", ""), event.get("To Grade", ""), event.get("From Grade", ""), event.get("Action", "")]
+                (downgrades if "down" in action_text or "sell" in action_text or "underperform" in action_text else upgrades).append(row)
+        for rows, color, name in [(upgrades, "#22c55e", "Analyst upgrades"), (downgrades, "#ef4444", "Analyst downgrades")]:
+            if rows:
+                frame_rows = pd.DataFrame(rows, columns=["Date", "Firm", "To Grade", "From Grade", "Action"])
+                fig.add_trace(go.Scatter(x=frame_rows.Date, y=[bottom_y] * len(frame_rows), name=name, mode="markers", marker={"color": color, "symbol": "circle", "size": 9}, customdata=frame_rows[["Firm", "To Grade", "From Grade", "Action"]], hovertemplate="%{x|%Y-%m-%d}<br>%{customdata[0]}<br>%{customdata[1]} from %{customdata[2]}<br>%{customdata[3]}<extra></extra>"))
     fig.add_annotation(x=1.02, y=0.82, xref="paper", yref="paper", text="ⓘ Insider", showarrow=False, font={"color": "#d8b4fe"})
     fig.add_annotation(x=1.02, y=0.68, xref="paper", yref="paper", text="ⓘ EPS / actions", showarrow=False, font={"color": "#86efac"})
     fig.update_yaxes(title_text="Close", secondary_y=False); fig.update_yaxes(title_text="Insider trade volume ($)", secondary_y=True, zeroline=True)
@@ -532,7 +540,18 @@ def closest_peers(symbol: str) -> list[str]:
             if candidate == symbol: continue
             info = enrichment(candidate)
             rows.append((candidate, info.get("market_cap") or 0))
-    return [candidate for candidate, _ in sorted(rows, key=lambda x: x[1], reverse=True)[:4]]
+    return [candidate for candidate, _ in sorted(rows, key=lambda x: x[1], reverse=True)[:3]]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def marketchameleon_peers(symbol: str) -> list[str]:
+    """Attempt the requested Market Chameleon peer page, then let the caller use the SEC/Yahoo fallback."""
+    try:
+        html = requests.get(f"https://marketchameleon.com/Overview/{symbol.upper()}/Peer-Comparison/", headers={"User-Agent": "Mozilla/5.0"}, timeout=15).text
+        candidates = list(dict.fromkeys(re.findall(r"/Overview/([A-Z0-9.-]+)/", html, flags=re.I)))
+        return [candidate.upper() for candidate in candidates if candidate.upper() != symbol.upper()][:3]
+    except Exception:
+        return []
 
 
 def style_financial_table(frame: pd.DataFrame, peer_frames: list[pd.DataFrame] | None = None):
@@ -541,7 +560,7 @@ def style_financial_table(frame: pd.DataFrame, peer_frames: list[pd.DataFrame] |
     valid_peer_frames = [p for p in peer_frames if isinstance(p, pd.DataFrame) and not p.empty]
     peer_yoy = pd.concat(valid_peer_frames, axis=0) if valid_peer_frames else pd.DataFrame()
     def style(data: pd.DataFrame):
-        out = pd.DataFrame("", index=data.index, columns=data.columns)
+        out = pd.DataFrame("background-color: transparent;", index=data.index, columns=data.columns)
         for idx in data.index:
             label = str(idx)
             if "YoY %" in label:
@@ -647,6 +666,17 @@ def multiple_price_targets(metrics: dict[str, Any], extra: dict[str, Any], peers
     return {"Price/Sales": float(average["P/S"] * sales_per_share) if pd.notna(average.get("P/S")) and sales_per_share else None, "Price/Earnings": float(average["P/E"] * eps) if pd.notna(average.get("P/E")) and eps else None, "Price/PEG": float(average["PEG"] * growth * eps / 100) if pd.notna(average.get("PEG")) and growth and eps else None}
 
 
+def company_peg_ratio(metrics: dict[str, Any], extra: dict[str, Any]) -> float | None:
+    raw = extra.get("valuation", {}).get("PEG") if isinstance(extra.get("valuation"), dict) else None
+    if raw is not None:
+        try: return float(raw)
+        except (TypeError, ValueError): pass
+    shares = float(metrics["shares"].iloc[-1]) if isinstance(metrics.get("shares"), pd.Series) and not metrics["shares"].empty else 0
+    net_income = ttm(metrics.get("net")); market_cap = extra.get("market_cap") or 0; growth = pct(extra.get("analyst_growth")) or metrics.get("eps_yoy")
+    pe = market_cap / net_income if market_cap and net_income else None
+    return pe / growth if pe and growth and growth > 0 and shares else None
+
+
 def main() -> None:
     st.title("Equity Signal Lab")
     st.caption("A filing-aware NYSE/Nasdaq research workbench — signals are screening heuristics, not investment advice.")
@@ -724,11 +754,15 @@ def main() -> None:
             row = {"Symbol": symbol, "Metrics": metrics, "Extra": extra, "Insider 90d $": extra.get("insider_90d")}
         st.subheader(f"{symbol} · {extra.get('sector', 'Sector unavailable')}")
         st.write(extra.get("summary") or "Business summary unavailable from the current provider.")
+        st.markdown("**Peer selection**")
         peer_source = st.radio("Peer source", ["Industry / market-cap", "Finviz first 3"], horizontal=True, key="peer_source")
-        default_peer_list = finviz_peers(symbol) if peer_source == "Finviz first 3" else closest_peers(symbol)
+        default_peer_list = finviz_peers(symbol) if peer_source == "Finviz first 3" else marketchameleon_peers(symbol)
         if not default_peer_list: default_peer_list = closest_peers(symbol)
-        multiple_targets = multiple_price_targets(metrics, extra, default_peer_list)
-        peer_valuation = valuation_frame(default_peer_list)
+        peer_input_key = f"peer_input_{symbol}_{peer_source.replace(' ', '_').replace('/', '_')}"
+        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", value=", ".join(default_peer_list), key=peer_input_key).split(",") if p.strip() and p.strip().upper() != symbol][:4]
+        multiple_targets = multiple_price_targets(metrics, extra, peers)
+        peer_valuation = valuation_frame(peers)
+        peg_ratio = company_peg_ratio(metrics, extra)
         dcf_default = default_dcf_price(metrics, extra); consensus_target = extra.get("target"); current_price = extra.get("price")
         dcf_upside = dcf_default / current_price - 1 if dcf_default and current_price else None
         consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
@@ -736,17 +770,18 @@ def main() -> None:
         a, b, c, d = st.columns(4)
         a.metric("Market cap ($mm)", f"{cap_mm:,.1f}" if cap_mm is not None else "NA"); b.metric("Stock price", fmt(current_price)); c.metric("GICS industry", extra.get("gics_industry") or "NA"); d.metric("Marketplace", extra.get("marketplace") or "NA")
         a, b, c, d = st.columns(4)
-        a.metric("Analyst consensus", str(extra.get("consensus_key") or extra.get("recommendation") or "NA").replace("_", " ").title()); b.metric("Analyst price target", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); c.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA"); d.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA")
+        a.metric("Analyst consensus", str(extra.get("consensus_key") or extra.get("recommendation") or "NA").replace("_", " ").title()); b.metric("Analyst price target", fmt(consensus_target), f"{consensus_upside:.1%} vs current" if consensus_upside is not None else "NA"); c.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA"); d.metric("Price/Sales stock price", fmt(multiple_targets["Price/Sales"]), f"{multiple_targets['Price/Sales'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Sales"] and current_price else "NA")
         a, b, c, d = st.columns(4)
-        a.metric("Price per PEG ratio", fmt(multiple_targets["Price/PEG"]), f"{multiple_targets['Price/PEG'] / current_price - 1:.1%} vs current" if multiple_targets["Price/PEG"] and current_price else "NA"); b.metric("Last earnings", extra.get("last_earnings") or "NA"); c.metric("Next earnings", extra.get("next_earnings") or "NA"); d.metric("DCF stock price", fmt(dcf_default), f"{dcf_upside:.1%} vs current" if dcf_upside is not None else "NA")
+        a.metric("Price/Earnings stock price", fmt(multiple_targets["Price/Earnings"]), f"{multiple_targets['Price/Earnings'] / current_price - 1:.1%} vs current" if multiple_targets["Price/Earnings"] and current_price else "NA"); b.metric("PEG ratio", fmt(peg_ratio)); c.metric("Last earnings", extra.get("last_earnings") or "NA"); d.metric("Next earnings", extra.get("next_earnings") or "NA")
+        peg_label = "Good" if peg_ratio is not None and 0 < peg_ratio < 1 else "Fair" if peg_ratio is not None and abs(peg_ratio - 1) <= .15 else "Bad/Expensive" if peg_ratio is not None and peg_ratio > 1 else "Red Flag" if peg_ratio is not None and peg_ratio < 0 else "NA"
+        st.caption(f"PEG interpretation: **{peg_label}** — Good (<1.0) means inexpensive for growth; Fair (around 1.0) means fairly priced; Bad/Expensive (>1.0) means expensive for expected growth; Red Flag (negative) means losses or shrinking growth.")
+        chart_frame = prices(symbol, "2y")
+        if not chart_frame.empty:
+            st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
+        st.caption("EMA colors: 20-day deeper orange, 200-day gold, 200-week thick gold. Green/red circles mark earnings surprises; green/red circles along the bottom border mark analyst upgrades/downgrades.")
         st.markdown("**Reported financials (SEC XBRL facts)**")
         annual_view = st.radio("Reporting period", ["Annual", "Quarterly"], horizontal=True, key="reporting_period") == "Annual"
         company_table = statement_frame(metrics, annual=annual_view)
-        peer_signature = f"{symbol}:{peer_source}"
-        if st.session_state.get("peer_signature") != peer_signature:
-            st.session_state["peer_signature"] = peer_signature
-            st.session_state["peer_input"] = ", ".join(default_peer_list)
-        peers = [p.strip().upper() for p in st.text_input("Closest competitors (comma-separated)", key="peer_input").split(",") if p.strip() and p.strip().upper() != symbol][:4]
         peer_tables = [statement_frame(filing_metrics(peer), annual=annual_view) for peer in peers]
         st.markdown("**Reported financials — selected stock**")
         st.dataframe(style_financial_table(company_table, peer_tables), use_container_width=True)
@@ -759,10 +794,6 @@ def main() -> None:
             comparison_table = statement_frame(filing_metrics(peer_symbol), annual=annual_view)
         st.markdown(f"**Reported financials — {peer_label}**")
         st.dataframe(style_financial_table(comparison_table), use_container_width=True)
-        chart_frame = prices(symbol, "2y")
-        if not chart_frame.empty:
-            st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
-        st.caption("EMA colors: 20-day orange, 200-day gold, 200-week thick gold. The chart includes insider, earnings, analyst-action and Clenow annotations.")
         available_lines = [label for _, label, _ in STATEMENT_LINES if any(str(index).endswith(f"· {label} ($mm)") or str(index).endswith(f"· {label}") for index in company_table.index)]
         if available_lines:
             selected_line = st.selectbox("Financial line for peer chart", available_lines, key="financial_line")
