@@ -1335,10 +1335,25 @@ st.dataframe(
     use_container_width=True,
 )
 
-        available_lines = [label for _, label, _ in STATEMENT_LINES if any(str(index).endswith(f"· {label} ($mm)") or str(index).endswith(f"· {label}") for index in company_table.index)]
-        if available_lines:
-            selected_line = st.selectbox("Financial line for peer chart", available_lines, key="financial_line")
-            def peer_metric_frame_from_metrics(
+available_lines = [
+    label
+    for _, label, _ in STATEMENT_LINES
+    if any(
+        str(index).endswith(f"· {label} ($mm)")
+        or str(index).endswith(f"· {label}")
+        for index in company_table.index
+    )
+]
+
+if available_lines:
+    selected_line = st.selectbox(
+        "Financial line for peer chart",
+        available_lines,
+        key="financial_line",
+    )
+
+
+def peer_metric_frame_from_metrics(
     metrics_by_symbol: dict[str, dict[str, Any]],
     line: str,
     annual: bool = True,
@@ -1382,6 +1397,7 @@ st.dataframe(
                 )
             else:
                 series = pd.Series(dtype=float)
+
         else:
             series = metrics.get(key)
 
@@ -1402,10 +1418,13 @@ st.dataframe(
     frame.loc["Industry average"] = frame.mean(axis=0)
 
     return frame
+
+
 comparison_metrics = {
     symbol: financial_metrics,
     **peer_financial_metrics,
 }
+
 
 comparison = peer_metric_frame_from_metrics(
     comparison_metrics,
