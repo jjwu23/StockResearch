@@ -182,12 +182,25 @@ def latest_yoy(series: pd.Series) -> float | None:
 
 def filing_metrics(symbol: str) -> dict[str, Any]:
     bundle = sec_facts(symbol)
-    revenue = fact_series(bundle, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"])
+    revenue = fact_series(bundle, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"])
     eps = fact_series(bundle, ["EarningsPerShareDiluted", "EarningsPerShareBasic"], "USD/shares")
     net = fact_series(bundle, ["NetIncomeLoss", "ProfitLoss"])
+    net_income = fact_series(bundle, ["NetIncomeLoss", "ProfitLoss"])
     gross = fact_series(bundle, ["GrossProfit"])
     operating = fact_series(bundle, ["OperatingIncomeLoss"])
     cfo = fact_series(bundle, ["NetCashProvidedByUsedInOperatingActivities"])
+    capex = fact_series(bundle, ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"])
+    cash = fact_series(bundle, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"])
+    debt = fact_series(bundle, ["LongTermDebtCurrent",
+        "LongTermDebtNoncurrent",
+        "LongTermDebt"])
+    book_value = fact_series(bundle, ["StockholdersEquity",
+        "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest",
+    ])
+    tangible_book = fact_series(bundle, ["StockholdersEquity"])
+    dividends = fact_series(bundle, ["PaymentsOfDividends",
+        "PaymentsOfDividendsCommonStock"])
+
     result = {"cik": bundle.get("cik"), "name": bundle.get("name", symbol), "revenue": revenue, "eps": eps, "net": net, "gross": gross, "operating": operating, "cfo": cfo}
     result.update({
         "cogs": fact_series(bundle, ["CostOfRevenue", "CostOfGoodsAndServicesSold"]),
@@ -290,7 +303,12 @@ def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
         ]),
         "operating": series_from(income, [
             "Operating Income",
+            "Operating Income Loss",
         ]),
+        "ebitda": series_from(
+        income,
+        ["EBITDA", "Normalized EBITDA"],
+        ),
         "interest": series_from(income, [
             "Interest Expense Non Operating",
             "Interest Income Non Operating",
@@ -301,6 +319,10 @@ def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
         "taxes": series_from(income, [
             "Tax Provision",
         ]),
+        "net_income": series_from(
+        income,
+        ["Net Income", "Net Income Common Stockholders"],
+        ),
         "net": series_from(income, [
             "Net Income",
             "Net Income Common Stockholders",
@@ -371,6 +393,30 @@ def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
         "long_term_debt": series_from(balance, [
             "Long Term Debt",
         ]),
+
+        "debt": series_from(
+            balance,
+            [
+                "Total Debt",
+                "Long Term Debt And Capital Lease Obligation",
+                "Long Term Debt",
+            ],
+        ),
+        "book_value": series_from(
+            balance,
+            [
+                "Stockholders Equity",
+                "Common Stock Equity",
+                "Total Equity Gross Minority Interest",
+            ],
+        ),
+        "tangible_book": series_from(
+            balance,
+            [
+                "Tangible Book Value",
+            ],
+        ),
+        
         "other_liabilities": series_from(balance, [
             "Other Non Current Liabilities",
         ]),
@@ -433,7 +479,24 @@ def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
         "capex": series_from(cashflow, [
             "Capital Expenditure",
             "Capital Expenditures",
+            "Capital Expenditure Reported",
         ]),
+        "net_cash_flow": series_from(
+            cashflow,
+            [
+                "Free Cash Flow",
+                "Changes In Cash",
+                "Net Change In Cash",
+            ],
+        ),
+        "dividends": series_from(
+            cashflow,
+            [
+                "Cash Dividends Paid",
+                "Common Stock Dividend Paid",
+                "Common Stock Payments",
+            ],
+        ),
         "proceeds_debt": series_from(cashflow, [
             "Issuance Of Debt",
             "Net Issuance Payments Of Debt",
@@ -441,6 +504,7 @@ def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
         "payments_debt": series_from(cashflow, [
             "Repayment Of Debt",
         ]),
+        
     }
 
     if metrics["gross"].empty and not metrics["revenue"].empty and not metrics["cogs"].empty:
@@ -450,6 +514,24 @@ def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
         not metrics["rd"].empty or not metrics["ga"].empty
     ):
         metrics["opex"] = metrics["rd"].add(metrics["ga"], fill_value=0)
+
+    # Yahoo does not always provide EBITDA directly.
+    # Fall back to Operating Income + Depreciation & Amortization.
+    if metrics["ebitda"].empty:
+        operating = metrics.get("operating")
+        depreciation = metrics.get("depreciation")
+
+        if (
+            isinstance(operating, pd.Series)
+            and not operating.empty
+            and isinstance(depreciation, pd.Series)
+        ):
+            metrics["ebitda"] = (
+                operating
+                + depreciation.reindex(operating.index).fillna(0)
+            )
+        else:
+            metrics["ebitda"] = pd.Series(dtype=float)
 
     metrics["revenue_yoy"] = latest_yoy(metrics["revenue"])
     metrics["eps_yoy"] = latest_yoy(metrics["eps"])
@@ -1168,33 +1250,63 @@ def peer_metric_frame_from_metrics(
 
     return frame
 
+def latest_metric(
+    metrics: dict[str, Any],
+    key: str,
+) -> float | None:
+    value = metrics.get(key)
+
+    if isinstance(value, pd.Series):
+        value = value.dropna()
+
+        if value.empty:
+            return None
+
+        return float(value.iloc[-1])
+
+    if value is None:
+        return None
+
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def roaring_kitty_comparables(
     symbol: str,
     metrics: dict[str, Any],
     extra: dict[str, Any],
 ) -> dict[str, Any]:
-    """Build Roaring Kitty-style insider and deep-value comparison metrics."""
+    """Calculate Roaring Kitty-style insider and value metrics."""
 
     result = {
-        "Insider purchases (1M)": None,
-        "Insider purchases (6M)": None,
-        "<1 week insider purchase ($k)": None,
-        "1-2 week insider purchase ($k)": None,
-        "2-4 week insider purchase ($k)": None,
-        "3M insider purchase ($k)": None,
-        "12M insider purchase ($k)": None,
-        "Sales / Price": None,
-        "EBITDA / EV": None,
-        "Tangible Book / Price": None,
-        "Book Value / Price": None,
-        "Net Income / Price": None,
-        "Operating Cash Flow / Price": None,
-        "Simple Free Cash Flow / Price": None,
-        "Net Cash Flow / Price": None,
-        "Div / Price": None,
-        "Cash / Price": None,
-        "Net Cash / Price": None,
+        "Insider purchases (1M)": np.nan,
+        "Insider purchases (6M)": np.nan,
+        "<1 week insider purchase ($k)": np.nan,
+        "1-2 week insider purchase ($k)": np.nan,
+        "2-4 week insider purchase ($k)": np.nan,
+        "3M insider purchase ($k)": np.nan,
+        "12M insider purchase ($k)": np.nan,
+        "Sales / Price": np.nan,
+        "EBITDA / EV": np.nan,
+        "Tangible Book / Price": np.nan,
+        "Book Value / Price": np.nan,
+        "Net Income / Price": np.nan,
+        "Operating Cash Flow / Price": np.nan,
+        "Simple Free Cash Flow / Price": np.nan,
+        "Net Cash Flow / Price": np.nan,
+        "Div / Price": np.nan,
+        "Cash / Price": np.nan,
+        "Net Cash / Price": np.nan,
     }
+
+    market_cap = extra.get("market_cap")
+
+    try:
+        market_cap = float(market_cap) if market_cap else None
+    except (TypeError, ValueError):
+        market_cap = None
 
     # ---------------------------------------------------------
     # Insider purchases
@@ -1208,10 +1320,14 @@ def roaring_kitty_comparables(
         if insider is not None and not insider.empty:
             insider = insider.copy()
 
-            # Normalize date column.
             date_col = next(
                 (
-                    c for c in ["Date", "date", "Transaction Date", "Start Date"]
+                    c for c in [
+                        "Date",
+                        "date",
+                        "Transaction Date",
+                        "Start Date",
+                    ]
                     if c in insider.columns
                 ),
                 None,
@@ -1225,7 +1341,7 @@ def roaring_kitty_comparables(
 
                 insider = insider.dropna(subset=["_date"])
 
-                # Identify transaction type.
+                # Search all textual columns for transaction type.
                 text_columns = [
                     c for c in insider.columns
                     if insider[c].dtype == "object"
@@ -1245,10 +1361,9 @@ def roaring_kitty_comparables(
                         index=insider.index,
                     )
 
-                # Prefer explicit purchase/buy transactions.
                 purchase_mask = (
                     transaction_text.str.contains(
-                        r"\bbuy\b|\bpurchase\b|\bacquisition\b|\bopen market",
+                        r"\bbuy\b|\bbought\b|\bpurchase\b|open market",
                         regex=True,
                         na=False,
                     )
@@ -1261,7 +1376,6 @@ def roaring_kitty_comparables(
 
                 purchases = insider.loc[purchase_mask].copy()
 
-                # Find transaction value.
                 value_col = next(
                     (
                         c for c in [
@@ -1270,6 +1384,7 @@ def roaring_kitty_comparables(
                             "Value ($)",
                             "Total Value",
                             "Amount",
+                            "Transaction Value ($)",
                         ]
                         if c in purchases.columns
                     ),
@@ -1291,152 +1406,150 @@ def roaring_kitty_comparables(
 
                 now = pd.Timestamp.now().normalize()
 
-                def window(days: int) -> pd.DataFrame:
+                def recent(days: int) -> pd.DataFrame:
                     return purchases[
                         (purchases["_date"] >= now - pd.Timedelta(days=days))
                         & (purchases["_date"] <= now)
                     ]
 
-                one_month = window(30)
-                six_month = window(180)
+                one_month = recent(30)
+                six_month = recent(180)
 
                 result["Insider purchases (1M)"] = len(one_month)
                 result["Insider purchases (6M)"] = len(six_month)
 
                 result["<1 week insider purchase ($k)"] = (
-                    one_month.loc[
-                        one_month["_date"] >= now - pd.Timedelta(days=7),
-                        "_value",
-                    ].sum() / 1_000
-                    if "_value" in one_month
-                    else None
+                    recent(7)["_value"].sum() / 1_000
                 )
 
                 result["1-2 week insider purchase ($k)"] = (
-                    one_month.loc[
-                        (one_month["_date"] < now - pd.Timedelta(days=7))
-                        & (one_month["_date"] >= now - pd.Timedelta(days=14)),
-                        "_value",
-                    ].sum() / 1_000
+                    (
+                        recent(14)
+                        .loc[
+                            lambda x: x["_date"]
+                            < now - pd.Timedelta(days=7)
+                        ]["_value"]
+                        .sum()
+                    )
+                    / 1_000
                 )
 
                 result["2-4 week insider purchase ($k)"] = (
-                    one_month.loc[
-                        (one_month["_date"] < now - pd.Timedelta(days=14))
-                        & (one_month["_date"] >= now - pd.Timedelta(days=28)),
-                        "_value",
-                    ].sum() / 1_000
+                    (
+                        recent(28)
+                        .loc[
+                            lambda x: x["_date"]
+                            < now - pd.Timedelta(days=14)
+                        ]["_value"]
+                        .sum()
+                    )
+                    / 1_000
                 )
 
                 result["3M insider purchase ($k)"] = (
-                    window(90)["_value"].sum() / 1_000
+                    recent(90)["_value"].sum() / 1_000
                 )
 
                 result["12M insider purchase ($k)"] = (
-                    window(365)["_value"].sum() / 1_000
+                    recent(365)["_value"].sum() / 1_000
                 )
 
     except Exception:
         pass
 
     # ---------------------------------------------------------
-    # Valuation / balance-sheet ratios
-    #
-    # These are expressed as VALUE / PRICE, which is the inverse
-    # of the more familiar price-to-value multiple.
+    # Financial values
     # ---------------------------------------------------------
-    price = extra.get("price")
-    market_cap = extra.get("market_cap")
+    revenue = latest_metric(metrics, "revenue")
+    ebitda = latest_metric(metrics, "ebitda")
+    tangible_book = latest_metric(metrics, "tangible_book")
+    book_value = latest_metric(metrics, "book_value")
+    net_income = latest_metric(metrics, "net_income")
+    cfo = latest_metric(metrics, "cfo")
+    capex = latest_metric(metrics, "capex")
+    net_cash_flow = latest_metric(metrics, "net_cash_flow")
+    dividends = latest_metric(metrics, "dividends")
 
-    def latest_value(key: str) -> float | None:
-        value = metrics.get(key)
+    cash = latest_metric(metrics, "cash")
+    debt = latest_metric(metrics, "debt")
 
-        if isinstance(value, pd.Series):
-            value = value.dropna()
-            return float(value.iloc[-1]) if not value.empty else None
+    # Prefer enrichment values where available.
+    if extra.get("cash") is not None:
+        cash = float(extra["cash"])
 
-        if value is None:
-            return None
+    if extra.get("debt") is not None:
+        debt = float(extra["debt"])
 
-        try:
-            return float(value)
-        except Exception:
-            return None
+    # ---------------------------------------------------------
+    # Sales / Price
+    # ---------------------------------------------------------
+    if revenue is not None and market_cap:
+        result["Sales / Price"] = revenue / market_cap
 
-    def ratio_to_market_cap(value: float | None) -> float | None:
-        if value is None or not market_cap:
-            return None
-        return value / market_cap
+    # ---------------------------------------------------------
+    # EBITDA / EV
+    # ---------------------------------------------------------
+    if market_cap:
+        enterprise_value = market_cap + (debt or 0) - (cash or 0)
 
-    # Revenue / Market Cap = Sales / Price.
-    revenue = latest_value("revenue")
-    result["Sales / Price"] = ratio_to_market_cap(revenue)
+        if ebitda is not None and enterprise_value > 0:
+            result["EBITDA / EV"] = (
+                ebitda / enterprise_value
+            )
 
-    # EBITDA / EV.
-    ebitda = latest_value("ebitda")
-    enterprise_value = extra.get("enterprise_value")
+    # ---------------------------------------------------------
+    # Equity-value ratios
+    # ---------------------------------------------------------
+    if market_cap:
+        if tangible_book is not None:
+            result["Tangible Book / Price"] = (
+                tangible_book / market_cap
+            )
 
-    if enterprise_value is None:
-        debt = extra.get("debt") or 0
-        cash = extra.get("cash") or 0
-        if market_cap:
-            enterprise_value = market_cap + debt - cash
+        if book_value is not None:
+            result["Book Value / Price"] = (
+                book_value / market_cap
+            )
 
-    if ebitda is not None and enterprise_value:
-        result["EBITDA / EV"] = ebitda / enterprise_value
+        if net_income is not None:
+            result["Net Income / Price"] = (
+                net_income / market_cap
+            )
 
-    # Book value / Price.
-    book_value = latest_value("book_value")
-    if book_value is None:
-        book_value = latest_value("book")
+        if cfo is not None:
+            result["Operating Cash Flow / Price"] = (
+                cfo / market_cap
+            )
 
-    result["Book Value / Price"] = ratio_to_market_cap(book_value)
+        if cfo is not None and capex is not None:
+            # Capex is usually reported as a negative cash-flow value.
+            simple_fcf = cfo - abs(capex)
 
-    # Tangible book value.
-    tangible_book = latest_value("tangible_book")
-    result["Tangible Book / Price"] = ratio_to_market_cap(tangible_book)
+            result["Simple Free Cash Flow / Price"] = (
+                simple_fcf / market_cap
+            )
 
-    # Net income / Price.
-    net_income = latest_value("net_income")
-    result["Net Income / Price"] = ratio_to_market_cap(net_income)
+        if net_cash_flow is not None:
+            result["Net Cash Flow / Price"] = (
+                net_cash_flow / market_cap
+            )
 
-    # Operating cash flow / Price.
-    operating_cash_flow = latest_value("cfo")
-    result["Operating Cash Flow / Price"] = ratio_to_market_cap(
-        operating_cash_flow
-    )
+        if dividends is not None:
+            result["Div / Price"] = (
+                abs(dividends) / market_cap
+            )
 
-    # Simple FCF / Price.
-    capex = latest_value("capex")
-    if operating_cash_flow is not None and capex is not None:
-        simple_fcf = operating_cash_flow - abs(capex)
-        result["Simple Free Cash Flow / Price"] = ratio_to_market_cap(
-            simple_fcf
-        )
+        if cash is not None:
+            result["Cash / Price"] = (
+                cash / market_cap
+            )
 
-    # Net cash flow / Price.
-    net_cash_flow = latest_value("net_cash_flow")
-    result["Net Cash Flow / Price"] = ratio_to_market_cap(net_cash_flow)
+        if cash is not None:
+            net_cash = cash - (debt or 0)
 
-    # Dividends / Price.
-    dividends = latest_value("dividends")
-    result["Div / Price"] = ratio_to_market_cap(dividends)
-
-    # Cash / Price.
-    cash = extra.get("cash")
-    if cash is None:
-        cash = latest_value("cash")
-
-    result["Cash / Price"] = ratio_to_market_cap(cash)
-
-    # Net cash / Price.
-    debt = extra.get("debt")
-    if debt is None:
-        debt = latest_value("debt")
-
-    if cash is not None:
-        net_cash = cash - (debt or 0)
-        result["Net Cash / Price"] = ratio_to_market_cap(net_cash)
+            result["Net Cash / Price"] = (
+                net_cash / market_cap
+            )
 
     return result
 
@@ -1564,6 +1677,7 @@ def main() -> None:
         if not chart_frame.empty:
             st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
         st.caption("EMA colors: 20-day deeper orange, 200-day gold, 200-week thick gold. Green/red circles mark earnings surprises; green/red circles along the bottom border mark analyst upgrades/downgrades.")
+
         st.markdown("**Reported financials**")
 
         financial_source = st.radio(
@@ -1590,17 +1704,22 @@ def main() -> None:
 
         if financial_source == "SEC XBRL":
             financial_metrics = metrics
+
             peer_financial_metrics = {
                 peer: filing_metrics(peer)
                 for peer in peers
             }
+
             financial_source_label = "SEC XBRL"
+
         else:
             financial_metrics = yahoo_statement_metrics(symbol)
+
             peer_financial_metrics = {
                 peer: yahoo_statement_metrics(peer)
                 for peer in peers
             }
+
             financial_source_label = "Yahoo Finance"
 
         company_table = statement_frame(
@@ -1628,14 +1747,20 @@ def main() -> None:
         st.markdown(
             f"**Financials — {symbol} ({financial_source_label})**"
         )
+
         st.dataframe(
             style_financial_table(company_table, peer_tables),
             use_container_width=True,
         )
 
+        # ------------------------------------------------------------
+        # PEER COMPARISON TABLE
+        # ------------------------------------------------------------
+
         peer_label = st.selectbox(
             "Comparison table",
-            ["Industry average"] + [
+            ["Industry average"]
+            + [
                 f"Peer {i + 1} · {p}"
                 for i, p in enumerate(peers)
             ],
@@ -1643,7 +1768,11 @@ def main() -> None:
         )
 
         if peer_label == "Industry average":
-            aligned = [p for p in peer_tables if not p.empty]
+            aligned = [
+                p for p in peer_tables
+                if not p.empty
+            ]
+
             comparison_table = (
                 pd.concat(aligned)
                 .groupby(level=0)
@@ -1658,17 +1787,27 @@ def main() -> None:
                     columns=company_table.columns,
                 )
             )
+
         else:
-            peer_symbol = peers[
-                int(peer_label.split("·")[0].split()[-1]) - 1
-            ]
+            peer_number = (
+                int(
+                    peer_label
+                    .split("·")[0]
+                    .split()[-1]
+                )
+                - 1
+            )
+
+            peer_symbol = peers[peer_number]
 
             comparison_table = statement_frame(
                 peer_financial_metrics.get(
                     peer_symbol,
-                    yahoo_statement_metrics(peer_symbol)
-                    if financial_source == "Yahoo Finance"
-                    else filing_metrics(peer_symbol),
+                    (
+                        yahoo_statement_metrics(peer_symbol)
+                        if financial_source == "Yahoo Finance"
+                        else filing_metrics(peer_symbol)
+                    ),
                 ),
                 annual=annual_view,
             )
@@ -1682,15 +1821,25 @@ def main() -> None:
             use_container_width=True,
         )
 
+        # ------------------------------------------------------------
+        # FINANCIAL LINE PEER CHART
+        # ------------------------------------------------------------
+
         available_lines = [
             label
             for _, label, _ in STATEMENT_LINES
             if any(
-                str(index).endswith(f"· {label} ($mm)")
-                or str(index).endswith(f"· {label}")
+                str(index).endswith(
+                    f"· {label} ($mm)"
+                )
+                or str(index).endswith(
+                    f"· {label}"
+                )
                 for index in company_table.index
             )
         ]
+
+        selected_line = None
 
         if available_lines:
             selected_line = st.selectbox(
@@ -1698,124 +1847,205 @@ def main() -> None:
                 available_lines,
                 key="financial_line",
             )
-        
-            comparison_metrics = {
-                symbol: financial_metrics,
-                **peer_financial_metrics,
-            }
-        
+
+        # ------------------------------------------------------------
+        # PEER METRIC HELPER
+        # ------------------------------------------------------------
+
+        def peer_metric_frame_from_metrics(
+            metrics_by_symbol: dict[str, dict[str, Any]],
+            line: str,
+            annual: bool = True,
+        ) -> pd.DataFrame:
+
+            key = next(
+                (
+                    key
+                    for _, label, key in STATEMENT_LINES
+                    if label == line
+                ),
+                "revenue",
+            )
+
+            rows = {}
+
+            for metric_symbol, metric_data in metrics_by_symbol.items():
+
+                if key == "gross_margin_series":
+                    gross = metric_data.get("gross")
+                    revenue = metric_data.get("revenue")
+
+                    if (
+                        isinstance(gross, pd.Series)
+                        and isinstance(revenue, pd.Series)
+                    ):
+                        series = (
+                            gross
+                            .divide(
+                                revenue.reindex(gross.index),
+                                fill_value=np.nan,
+                            )
+                            * 100
+                        )
+                    else:
+                        series = pd.Series(dtype=float)
+
+                elif key == "operating_margin_series":
+                    operating = metric_data.get("operating")
+                    revenue = metric_data.get("revenue")
+
+                    if (
+                        isinstance(operating, pd.Series)
+                        and isinstance(revenue, pd.Series)
+                    ):
+                        series = (
+                            operating
+                            .divide(
+                                revenue.reindex(operating.index),
+                                fill_value=np.nan,
+                            )
+                            * 100
+                        )
+                    else:
+                        series = pd.Series(dtype=float)
+
+                else:
+                    series = metric_data.get(key)
+
+                if (
+                    isinstance(series, pd.Series)
+                    and not series.empty
+                ):
+                    series = series[
+                        ~series.index.duplicated(
+                            keep="last"
+                        )
+                    ]
+
+                    series = series.sort_index()
+
+                    rows[metric_symbol] = (
+                        series.groupby(
+                            series.index.year
+                        ).last()
+                        if annual
+                        else series.groupby(
+                            series.index.to_period("Q")
+                        ).last()
+                    )
+
+            if not rows:
+                return pd.DataFrame()
+
+            frame = pd.DataFrame(rows).T
+
+            frame.loc["Industry average"] = (
+                frame.mean(axis=0)
+            )
+
+            return frame
+
+        # ------------------------------------------------------------
+        # PEER CHART
+        # ------------------------------------------------------------
+
+        comparison_metrics = {
+            symbol: financial_metrics,
+            **peer_financial_metrics,
+        }
+
+        comparison = pd.DataFrame()
+
+        if selected_line:
             comparison = peer_metric_frame_from_metrics(
                 comparison_metrics,
                 selected_line,
                 annual=annual_view,
             )
-        
-            if not comparison.empty:
-                latest_column = comparison.columns[-1]
-                chart_values = (
-                    comparison[latest_column]
-                    .rename("Latest reported value")
-                    .to_frame()
-                )
-        
-                st.markdown(
-                    f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**"
-                )
-        
-                colors = [
-                    "#2563eb" if name == symbol
-                    else "#4b5563" if name == "Industry average"
-                    else "#d1d5db"
-                    for name in chart_values.index
-                ]
-        
-                peer_fig = go.Figure(
-                    go.Bar(
-                        x=chart_values.index,
-                        y=chart_values.iloc[:, 0],
-                        marker_color=colors,
-                        hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>",
-                    )
-                )
-        
-                peer_fig.update_layout(
-                    height=330,
-                    template="plotly_white",
-                    margin={"l": 20, "r": 20, "t": 20, "b": 60},
-                )
-        
-                st.plotly_chart(peer_fig, use_container_width=True)
 
+        if not comparison.empty:
 
-        # ---------------------------------------------------------
-        # Roaring Kitty Comparables
-        # ---------------------------------------------------------
-        st.markdown("**Roaring Kitty Comparables**")
-        
-        rk_comps = roaring_kitty_comparables(
-            symbol,
-            metrics,
-            extra,
-        )
-        
-        rk_display = pd.DataFrame(
-            [
-                {
-                    "Metric": metric,
-                    symbol: value,
-                }
-                for metric, value in rk_comps.items()
+            latest_column = comparison.columns[-1]
+
+            chart_values = (
+                comparison[latest_column]
+                .rename("Latest reported value")
+                .to_frame()
+            )
+
+            st.markdown(
+                f"**{selected_line}: selected stock vs "
+                f"Peer 1/2/3 and industry average**"
+            )
+
+            colors = [
+                "#2563eb"
+                if name == symbol
+                else "#4b5563"
+                if name == "Industry average"
+                else "#d1d5db"
+                for name in chart_values.index
             ]
-        )
-        
-        def format_rk_value(row):
-            metric = row["Metric"]
-            value = row[symbol]
-        
-            if pd.isna(value) or value is None:
-                return "NA"
-        
-            if "purchase" in metric.lower() and "$k" in metric:
-                return f"${value:,.1f}k"
-        
-            if "purchases" in metric.lower():
-                return f"{int(value):,}"
-        
-            # Value / price metrics are yields.
-            return f"{value:.2%}"
-        
-        
-        rk_display[symbol] = rk_display.apply(
-            format_rk_value,
-            axis=1,
-        )
-        
-        st.dataframe(
-            rk_display,
-            use_container_width=True,
-            hide_index=True,
-        )
-        
-        st.caption(
-            "Roaring Kitty-style deep-value and insider-buying metrics. "
-            "Purchase windows are based on detected open-market insider purchases; "
-            "value/price metrics are expressed as the underlying financial value "
-            "divided by market capitalization."
-        )
-        
+
+            peer_fig = go.Figure(
+                go.Bar(
+                    x=chart_values.index,
+                    y=chart_values.iloc[:, 0],
+                    marker_color=colors,
+                    hovertemplate=(
+                        "%{x}<br>"
+                        "%{y:,.1f}"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+
+            peer_fig.update_layout(
+                height=330,
+                template="plotly_white",
+                margin={
+                    "l": 20,
+                    "r": 20,
+                    "t": 20,
+                    "b": 60,
+                },
+            )
+
+            st.plotly_chart(
+                peer_fig,
+                use_container_width=True,
+            )
+
+        # ------------------------------------------------------------
+        # COMPARABLE VALUATION MULTIPLES
+        # ------------------------------------------------------------
+
         st.markdown("**Comparable valuation multiples**")
+
+        valuation_comparison = valuation_frame(
+            [symbol] + peers
+        )
+
         st.dataframe(
             style_valuation_table(
-                valuation_frame([symbol] + peers),
+                valuation_comparison,
                 symbol,
             ),
             use_container_width=True,
             hide_index=True,
         )
 
+        # ------------------------------------------------------------
+        # DCF WORKSPACE
+        # ------------------------------------------------------------
+
         st.markdown("**DCF workspace**")
 
-        analyst_growth = pct(extra.get("analyst_growth")) or 12.0
+        analyst_growth = (
+            pct(extra.get("analyst_growth"))
+            or 12.0
+        )
+
         consensus_target = extra.get("target")
 
         assumptions = st.columns(5)
@@ -1828,7 +2058,10 @@ def main() -> None:
 
         margin = assumptions[1].number_input(
             "Operating margin %",
-            value=float(metrics.get("operating_margin") or 20),
+            value=float(
+                metrics.get("operating_margin")
+                or 20
+            ),
             key="dcf_margin",
         )
 
@@ -1847,9 +2080,17 @@ def main() -> None:
         shares = assumptions[4].number_input(
             "Shares (mm)",
             value=(
-                float(metrics.get("shares").iloc[-1] / 1_000_000)
-                if isinstance(metrics.get("shares"), pd.Series)
-                and not metrics["shares"].empty
+                float(
+                    metrics["shares"].iloc[-1]
+                    / 1_000_000
+                )
+                if (
+                    isinstance(
+                        metrics.get("shares"),
+                        pd.Series,
+                    )
+                    and not metrics["shares"].empty
+                )
                 else 1.0
             ),
             key="dcf_shares",
@@ -1857,7 +2098,8 @@ def main() -> None:
 
         st.caption(
             f"Analyst consensus growth used to prefill: "
-            f"{analyst_growth:.1f}%. Company guidance: "
+            f"{analyst_growth:.1f}%. "
+            f"Company guidance: "
             f"{extra.get('guidance') or 'Not available from the current source.'}"
         )
 
@@ -1873,49 +2115,79 @@ def main() -> None:
 
         forecast = pd.DataFrame(
             {
-                "Year": ["Y0 Actuals"] + [f"Y{i}" for i in range(1, 6)]
+                "Year": (
+                    ["Y0 Actuals"]
+                    + [f"Y{i}" for i in range(1, 6)]
+                )
             }
         )
 
         forecast["Revenue"] = [
-            base * (1 + revenue_growth / 100) ** i
+            base * (
+                1 + revenue_growth / 100
+            ) ** i
             for i in years
         ]
 
-        forecast["COGS"] = forecast.Revenue * (
-            base_cogs / base
-            if base
-            else (1 - (metrics.get("gross_margin") or 50) / 100)
+        forecast["COGS"] = (
+            forecast.Revenue
+            * (
+                base_cogs / base
+                if base
+                else (
+                    1
+                    - (
+                        metrics.get(
+                            "gross_margin"
+                        )
+                        or 50
+                    )
+                    / 100
+                )
+            )
         )
 
         forecast["Gross Profit"] = (
-            forecast["Revenue"] - forecast["COGS"]
+            forecast["Revenue"]
+            - forecast["COGS"]
         )
 
-        forecast["R&D"] = forecast.Revenue * (
-            base_rd / base
-            if base and base_rd
-            else 0.08
+        forecast["R&D"] = (
+            forecast["Revenue"]
+            * (
+                base_rd / base
+                if base and base_rd
+                else 0.08
+            )
         )
 
-        forecast["G&A"] = forecast.Revenue * (
-            base_ga / base
-            if base and base_ga
-            else 0.10
+        forecast["G&A"] = (
+            forecast["Revenue"]
+            * (
+                base_ga / base
+                if base and base_ga
+                else 0.10
+            )
         )
 
         forecast["Total Operating Expenses"] = (
-            forecast["R&D"] + forecast["G&A"]
+            forecast["R&D"]
+            + forecast["G&A"]
         )
 
         forecast["Operating Income"] = (
-            forecast.Revenue * margin / 100
+            forecast["Revenue"]
+            * margin
+            / 100
         )
 
-        forecast["Interest Income"] = forecast.Revenue * (
-            base_interest / base
-            if base and base_interest
-            else 0.005
+        forecast["Interest Income"] = (
+            forecast["Revenue"]
+            * (
+                base_interest / base
+                if base and base_interest
+                else 0.005
+            )
         )
 
         forecast["Pretax Income"] = (
@@ -1923,10 +2195,14 @@ def main() -> None:
             + forecast["Interest Income"]
         )
 
-        forecast["Taxes"] = forecast["Pretax Income"] * 0.21
+        forecast["Taxes"] = (
+            forecast["Pretax Income"]
+            * 0.21
+        )
 
         forecast["Net Income"] = (
-            forecast["Pretax Income"] - forecast["Taxes"]
+            forecast["Pretax Income"]
+            - forecast["Taxes"]
         )
 
         forecast["EPS"] = (
@@ -1938,7 +2214,15 @@ def main() -> None:
         forecast["Free Cash Flow"] = (
             [base_cfo - base_capex]
             + [
-                max(float(forecast.loc[i, "Net Income"]), 0)
+                max(
+                    float(
+                        forecast.loc[
+                            i,
+                            "Net Income",
+                        ]
+                    ),
+                    0,
+                )
                 for i in range(1, 6)
             ]
         )
@@ -1952,10 +2236,15 @@ def main() -> None:
         forecast_display = forecast.copy()
 
         forecast_display[amount_columns] = (
-            forecast_display[amount_columns] / 1_000_000
+            forecast_display[amount_columns]
+            / 1_000_000
         )
 
-        forecast_table = forecast_display.set_index("Year").T
+        forecast_table = (
+            forecast_display
+            .set_index("Year")
+            .T
+        )
 
         st.dataframe(
             forecast_table.style.format(
@@ -1973,9 +2262,13 @@ def main() -> None:
             use_container_width=True,
         )
 
-        fcf_forecast = forecast.loc[
-            1:, "Free Cash Flow"
-        ].to_numpy(dtype=float)
+        fcf_forecast = (
+            forecast.loc[
+                1:,
+                "Free Cash Flow",
+            ]
+            .to_numpy(dtype=float)
+        )
 
         discount_rate = max(
             wacc / 100,
@@ -1985,7 +2278,10 @@ def main() -> None:
         terminal_value = (
             fcf_forecast[-1]
             * (1 + terminal / 100)
-            / (discount_rate - terminal / 100)
+            / (
+                discount_rate
+                - terminal / 100
+            )
             if fcf_forecast.size
             else 0
         )
@@ -1994,11 +2290,15 @@ def main() -> None:
             float(
                 (
                     fcf_forecast
-                    / (1 + discount_rate)
+                    / (
+                        1 + discount_rate
+                    )
                     ** np.arange(1, 6)
                 ).sum()
                 + terminal_value
-                / (1 + discount_rate) ** 5
+                / (
+                    1 + discount_rate
+                ) ** 5
                 + (extra.get("cash") or 0)
                 - (extra.get("debt") or 0)
             )
@@ -2007,7 +2307,8 @@ def main() -> None:
         )
 
         dcf_price = (
-            pv_equity / (shares * 1_000_000)
+            pv_equity
+            / (shares * 1_000_000)
             if shares
             else None
         )
@@ -2025,10 +2326,14 @@ def main() -> None:
         )
 
         st.caption(
-            f"Editable DCF output: {fmt(dcf_price)} per share. "
-            "The headline DCF and analyst consensus metrics remain "
-            "at the top of this tab."
+            f"Editable DCF output: {fmt(dcf_price)} "
+            "per share. The headline DCF and analyst "
+            "consensus metrics remain at the top of this tab."
         )
+
+        # ------------------------------------------------------------
+        # INSIDER TRANSACTIONS
+        # ------------------------------------------------------------
 
         st.markdown("**Insider transactions**")
 
@@ -2036,6 +2341,7 @@ def main() -> None:
 
         if not openinsider.empty:
             st.caption("Source: OpenInsider")
+
             st.dataframe(
                 style_insider_table(
                     openinsider,
@@ -2044,6 +2350,7 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
         else:
             insider_table = insider_trades(symbol)
 
@@ -2063,6 +2370,10 @@ def main() -> None:
                 use_container_width=True,
                 hide_index=True,
             )
+
+        # ------------------------------------------------------------
+        # EARNINGS AND ANALYST ACTIONS
+        # ------------------------------------------------------------
 
         st.markdown("**Earnings and analyst actions**")
 
@@ -2109,8 +2420,8 @@ def main() -> None:
 
             st.caption(
                 "Analyst actions are sourced from the available "
-                "Yahoo Finance feed; MarketWatch estimate and analyst "
-                "tables are shown below when available."
+                "Yahoo Finance feed; MarketWatch estimate and "
+                "analyst tables are shown below when available."
             )
 
             st.dataframe(
@@ -2149,7 +2460,6 @@ def main() -> None:
                         use_container_width=True,
                         hide_index=True,
                     )
-
 
 
 if __name__ == "__main__":
