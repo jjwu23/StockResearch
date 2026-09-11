@@ -627,6 +627,51 @@ def insider_trades(symbol: str) -> pd.DataFrame:
     except Exception:
         return pd.DataFrame(columns=["Date", "Buy volume", "Sell volume", "Buy shares", "Sell shares"])
 
+def compute_deep_value_metrics(symbol: str, peer_symbols: list[str] = PEER_CANDIDATES) -> dict[str, Any]:
+    """Compute Roaring Kitty / Deep Value metrics: EBITDA/EV, TBV/P, BV/P, NCF/P, Div/P, NC/P, and Insider Activity."""
+    enf = enrichment(symbol)
+    market_cap = enf.get("market_cap") or 0.0
+    
+    statements = yahoo_statement_metrics(symbol)
+    
+    # Latest values extraction
+    total_debt = float(statements.get("debt", pd.Series()).iloc[-1]) if not statements.get("debt", pd.Series()).empty else 0.0
+    cash = float(statements.get("cash", pd.Series()).iloc[-1]) if not statements.get("cash", pd.Series()).empty else 0.0
+    ev = market_cap + total_debt - cash if market_cap else None
+    
+    ebitda = float(statements.get("ebitda", pd.Series()).iloc[-1]) if not statements.get("ebitda", pd.Series()).empty else 0.0
+    ebitda_ev = (ebitda / ev) if ev and ev > 0 else None
+    
+    tangible_book = float(statements.get("tangible_book", pd.Series()).iloc[-1]) if not statements.get("tangible_book", pd.Series()).empty else 0.0
+    tbv_p = (tangible_book / market_cap) if market_cap > 0 else None
+    
+    book_value = float(statements.get("book_value", pd.Series()).iloc[-1]) if not statements.get("book_value", pd.Series()).empty else 0.0
+    bv_p = (book_value / market_cap) if market_cap > 0 else None
+    
+    cfo = float(statements.get("cfo", pd.Series()).iloc[-1]) if not statements.get("cfo", pd.Series()).empty else 0.0
+    ncf_p = (cfo / market_cap) if market_cap > 0 else None
+    
+    dividends = float(statements.get("dividends", pd.Series()).iloc[-1]) if not statements.get("dividends", pd.Series()).empty else 0.0
+    div_p = (abs(dividends) / market_cap) if market_cap > 0 else None
+    
+    current_assets = float(statements.get("current_assets", pd.Series()).iloc[-1]) if not statements.get("current_assets", pd.Series()).empty else 0.0
+    liabilities = float(statements.get("liabilities", pd.Series()).iloc[-1]) if not statements.get("liabilities", pd.Series()).empty else 0.0
+    net_current_assets = current_assets - liabilities
+    nc_p = (net_current_assets / market_cap) if market_cap > 0 else None
+
+    insiders = insider_trades(symbol)
+    insider_summary = f"{len(insiders)} transactions tracked" if not insiders.empty else "No recent data"
+
+    return {
+        "EBITDA/EV": ebitda_ev,
+        "TBV/P": tbv_p,
+        "BV/P": bv_p,
+        "NCF/P": ncf_p,
+        "Div/P": div_p,
+        "NC/P": nc_p,
+        "Insider Activity": insider_summary,
+        "Market Cap": market_cap
+    }
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def finviz_snapshot(symbol: str) -> dict[str, Any]:
