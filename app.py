@@ -181,6 +181,265 @@ def latest_yoy(series: pd.Series) -> float | None:
 
 
 def filing_metrics(symbol: str) -> dict[str, Any]:
+    @st.cache_data(ttl=3600, show_spinner=False)
+def yahoo_financials(symbol: str) -> dict[str, Any]:
+    """Return Yahoo Finance financial statements using standardized yfinance line items."""
+    try:
+        ticker = yf.Ticker(symbol)
+
+        income = ticker.income_stmt
+        balance = ticker.balance_sheet
+        cashflow = ticker.cashflow
+
+        return {
+            "income": income if isinstance(income, pd.DataFrame) else pd.DataFrame(),
+            "balance": balance if isinstance(balance, pd.DataFrame) else pd.DataFrame(),
+            "cashflow": cashflow if isinstance(cashflow, pd.DataFrame) else pd.DataFrame(),
+        }
+    except Exception:
+        return {
+            "income": pd.DataFrame(),
+            "balance": pd.DataFrame(),
+            "cashflow": pd.DataFrame(),
+        }
+
+
+def yahoo_statement_metrics(symbol: str) -> dict[str, Any]:
+    """Map Yahoo Finance's standardized statement rows into the app's internal metric names."""
+    statements = yahoo_financials(symbol)
+    income = statements["income"]
+    balance = statements["balance"]
+    cashflow = statements["cashflow"]
+
+    def series_from(frame: pd.DataFrame, names: list[str]) -> pd.Series:
+        if frame.empty:
+            return pd.Series(dtype=float)
+
+        for name in names:
+            if name in frame.index:
+                series = pd.to_numeric(frame.loc[name], errors="coerce").dropna()
+                if not series.empty:
+                    series.index = pd.to_datetime(series.index)
+                    return series.sort_index()
+
+        return pd.Series(dtype=float)
+
+    metrics = {
+        "revenue": series_from(income, [
+            "Total Revenue",
+            "Operating Revenue",
+        ]),
+        "cogs": series_from(income, [
+            "Cost Of Revenue",
+        ]),
+        "gross": series_from(income, [
+            "Gross Profit",
+        ]),
+        "rd": series_from(income, [
+            "Research And Development",
+        ]),
+        "ga": series_from(income, [
+            "Selling General And Administration",
+        ]),
+        "opex": series_from(income, [
+            "Operating Expense",
+            "Total Operating Expenses",
+        ]),
+        "operating": series_from(income, [
+            "Operating Income",
+        ]),
+        "interest": series_from(income, [
+            "Interest Expense Non Operating",
+            "Interest Income Non Operating",
+        ]),
+        "pretax": series_from(income, [
+            "Pretax Income",
+        ]),
+        "taxes": series_from(income, [
+            "Tax Provision",
+        ]),
+        "net": series_from(income, [
+            "Net Income",
+            "Net Income Common Stockholders",
+        ]),
+        "eps": series_from(income, [
+            "Diluted EPS",
+            "Basic EPS",
+        ]),
+        "shares": series_from(income, [
+            "Diluted Average Shares",
+            "Basic Average Shares",
+        ]),
+
+        "cash": series_from(balance, [
+            "Cash Cash Equivalents And Short Term Investments",
+            "Cash And Cash Equivalents",
+        ]),
+        "receivables": series_from(balance, [
+            "Accounts Receivable",
+        ]),
+        "inventory": series_from(balance, [
+            "Inventory",
+        ]),
+        "prepaids": series_from(balance, [
+            "Other Current Assets",
+        ]),
+        "current_assets": series_from(balance, [
+            "Current Assets",
+        ]),
+        "ppe": series_from(balance, [
+            "Net PPE",
+        ]),
+        "lease_asset": series_from(balance, [
+            "Operating Lease Right Of Use Asset",
+        ]),
+        "deferred_tax_asset": series_from(balance, [
+            "Deferred Tax Assets",
+        ]),
+        "other_assets": series_from(balance, [
+            "Other Non Current Assets",
+        ]),
+        "assets": series_from(balance, [
+            "Total Assets",
+        ]),
+        "payables": series_from(balance, [
+            "Payables And Accrued Expenses",
+            "Accounts Payable",
+        ]),
+        "other_current_liabilities": series_from(balance, [
+            "Other Current Liabilities",
+        ]),
+        "deferred_revenue": series_from(balance, [
+            "Current Deferred Revenue",
+        ]),
+        "current_lease": series_from(balance, [
+            "Current Debt And Capital Lease Obligation",
+        ]),
+        "current_debt": series_from(balance, [
+            "Current Debt",
+        ]),
+        "current_liabilities": series_from(balance, [
+            "Current Liabilities",
+        ]),
+        "long_term_lease": series_from(balance, [
+            "Long Term Capital Lease Obligation",
+            "Long Term Debt And Capital Lease Obligation",
+        ]),
+        "long_term_debt": series_from(balance, [
+            "Long Term Debt",
+        ]),
+        "other_liabilities": series_from(balance, [
+            "Other Non Current Liabilities",
+        ]),
+        "liabilities": series_from(balance, [
+            "Total Liabilities Net Minority Interest",
+            "Total Liabilities",
+        ]),
+        "preferred_stock": series_from(balance, [
+            "Preferred Stock",
+        ]),
+        "common_stock": series_from(balance, [
+            "Common Stock Equity",
+        ]),
+        "apic": series_from(balance, [
+            "Additional Paid In Capital",
+        ]),
+        "aoci": series_from(balance, [
+            "Other Equity Adjustments",
+        ]),
+        "retained_earnings": series_from(balance, [
+            "Retained Earnings",
+        ]),
+        "noncontrolling": series_from(balance, [
+            "Minority Interest",
+        ]),
+        "equity": series_from(balance, [
+            "Stockholders Equity",
+            "Total Equity Gross Minority Interest",
+        ]),
+
+        "depreciation": series_from(cashflow, [
+            "Depreciation And Amortization",
+            "Depreciation",
+        ]),
+        "equity_comp": series_from(cashflow, [
+            "Stock Based Compensation",
+        ]),
+        "deferred_taxes": series_from(cashflow, [
+            "Deferred Tax",
+        ]),
+        "change_receivables": series_from(cashflow, [
+            "Change In Account Receivables",
+        ]),
+        "change_inventory": series_from(cashflow, [
+            "Change In Inventory",
+        ]),
+        "change_payables": series_from(cashflow, [
+            "Change In Payables And Accrued Expenses",
+        ]),
+        "change_other_current": series_from(cashflow, [
+            "Change In Other Current Assets",
+        ]),
+        "change_other_liabilities": series_from(cashflow, [
+            "Change In Other Current Liabilities",
+        ]),
+        "cfo": series_from(cashflow, [
+            "Operating Cash Flow",
+            "Total Cash From Operating Activities",
+        ]),
+        "capex": series_from(cashflow, [
+            "Capital Expenditure",
+            "Capital Expenditures",
+        ]),
+        "proceeds_debt": series_from(cashflow, [
+            "Issuance Of Debt",
+            "Net Issuance Payments Of Debt",
+        ]),
+        "payments_debt": series_from(cashflow, [
+            "Repayment Of Debt",
+        ]),
+    }
+
+    if metrics["gross"].empty and not metrics["revenue"].empty and not metrics["cogs"].empty:
+        metrics["gross"] = metrics["revenue"] - metrics["cogs"]
+
+    if metrics["opex"].empty and (
+        not metrics["rd"].empty or not metrics["ga"].empty
+    ):
+        metrics["opex"] = metrics["rd"].add(metrics["ga"], fill_value=0)
+
+    metrics["revenue_yoy"] = latest_yoy(metrics["revenue"])
+    metrics["eps_yoy"] = latest_yoy(metrics["eps"])
+    metrics["fcf_yoy"] = latest_yoy(metrics["cfo"])
+
+    revenue = metrics["revenue"]
+    net = metrics["net"]
+    gross = metrics["gross"]
+    operating = metrics["operating"]
+
+    metrics["net_margin"] = (
+        float(net.iloc[-1] / revenue.iloc[-1] * 100)
+        if not net.empty and not revenue.empty and revenue.iloc[-1]
+        else None
+    )
+
+    metrics["gross_margin"] = (
+        float(gross.iloc[-1] / revenue.iloc[-1] * 100)
+        if not gross.empty and not revenue.empty and revenue.iloc[-1]
+        else None
+    )
+
+    metrics["operating_margin"] = (
+        float(operating.iloc[-1] / revenue.iloc[-1] * 100)
+        if not operating.empty and not revenue.empty and revenue.iloc[-1]
+        else None
+    )
+
+    metrics["cik"] = None
+    metrics["name"] = symbol
+
+    return metrics
+
     bundle = sec_facts(symbol)
     revenue = fact_series(bundle, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"])
     eps = fact_series(bundle, ["EarningsPerShareDiluted", "EarningsPerShareBasic"], "USD/shares")
@@ -925,25 +1184,192 @@ def main() -> None:
         if not chart_frame.empty:
             st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
         st.caption("EMA colors: 20-day deeper orange, 200-day gold, 200-week thick gold. Green/red circles mark earnings surprises; green/red circles along the bottom border mark analyst upgrades/downgrades.")
-        st.markdown("**Reported financials (SEC XBRL facts)**")
-        annual_view = st.radio("Reporting period", ["Annual", "Quarterly"], horizontal=True, key="reporting_period") == "Annual"
-        company_table = statement_frame(metrics, annual=annual_view)
-        peer_tables = [statement_frame(filing_metrics(peer), annual=annual_view) for peer in peers]
-        st.markdown("**Reported financials — selected stock**")
-        st.dataframe(style_financial_table(company_table, peer_tables), use_container_width=True)
-        peer_label = st.selectbox("Comparison table", ["Industry average"] + [f"Peer {i + 1} · {p}" for i, p in enumerate(peers)], key="peer_table")
-        if peer_label == "Industry average":
-            aligned = [p for p in peer_tables if not p.empty]
-            comparison_table = pd.concat(aligned).groupby(level=0).mean().reindex(index=company_table.index, columns=company_table.columns) if aligned else pd.DataFrame(index=company_table.index, columns=company_table.columns)
-        else:
-            peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1]
-            comparison_table = statement_frame(filing_metrics(peer_symbol), annual=annual_view)
-        st.markdown(f"**Reported financials — {peer_label}**")
-        st.dataframe(style_financial_table(comparison_table), use_container_width=True)
+st.markdown("**Reported financials**")
+
+financial_source = st.radio(
+    "Financial data source",
+    ["SEC XBRL", "Yahoo Finance"],
+    horizontal=True,
+    key="financial_source",
+    help=(
+        "SEC XBRL uses reported filing facts and can have issuer-specific "
+        "taxonomy differences. Yahoo Finance normalizes statement line items "
+        "across companies, which can make peer comparison easier."
+    ),
+)
+
+annual_view = (
+    st.radio(
+        "Reporting period",
+        ["Annual", "Quarterly"],
+        horizontal=True,
+        key="reporting_period",
+    )
+    == "Annual"
+)
+
+if financial_source == "SEC XBRL":
+    financial_metrics = metrics
+    peer_financial_metrics = {
+        peer: filing_metrics(peer)
+        for peer in peers
+    }
+    financial_source_label = "SEC XBRL"
+else:
+    financial_metrics = yahoo_statement_metrics(symbol)
+    peer_financial_metrics = {
+        peer: yahoo_statement_metrics(peer)
+        for peer in peers
+    }
+    financial_source_label = "Yahoo Finance"
+
+company_table = statement_frame(
+    financial_metrics,
+    annual=annual_view,
+)
+
+peer_tables = [
+    statement_frame(
+        peer_financial_metrics[peer],
+        annual=annual_view,
+    )
+    for peer in peers
+]
+
+st.caption(
+    f"Source: {financial_source_label}. "
+    + (
+        "Values are derived from SEC Company Facts and retain issuer filing taxonomy."
+        if financial_source == "SEC XBRL"
+        else "Yahoo Finance provides normalized financial-statement line items."
+    )
+)
+
+st.markdown(
+    f"**Financials — {symbol} ({financial_source_label})**"
+)
+st.dataframe(
+    style_financial_table(company_table, peer_tables),
+    use_container_width=True,
+)
+
+peer_label = st.selectbox(
+    "Comparison table",
+    ["Industry average"] + [f"Peer {i + 1} · {p}" for i, p in enumerate(peers)],
+    key="peer_table",
+)
+
+if peer_label == "Industry average":
+    aligned = [p for p in peer_tables if not p.empty]
+    comparison_table = (
+        pd.concat(aligned)
+        .groupby(level=0)
+        .mean()
+        .reindex(index=company_table.index, columns=company_table.columns)
+        if aligned
+        else pd.DataFrame(
+            index=company_table.index,
+            columns=company_table.columns,
+        )
+    )
+else:
+    peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1]
+    comparison_table = statement_frame(
+        peer_financial_metrics.get(
+            peer_symbol,
+            yahoo_statement_metrics(peer_symbol)
+            if financial_source == "Yahoo Finance"
+            else filing_metrics(peer_symbol),
+        ),
+        annual=annual_view,
+    )
+
+st.markdown(
+    f"**Financials — {peer_label} ({financial_source_label})**"
+)
+st.dataframe(
+    style_financial_table(comparison_table),
+    use_container_width=True,
+)
+
         available_lines = [label for _, label, _ in STATEMENT_LINES if any(str(index).endswith(f"· {label} ($mm)") or str(index).endswith(f"· {label}") for index in company_table.index)]
         if available_lines:
             selected_line = st.selectbox("Financial line for peer chart", available_lines, key="financial_line")
-            comparison = peer_metric_frame([symbol] + peers, selected_line, annual=annual_view)
+            def peer_metric_frame_from_metrics(
+    metrics_by_symbol: dict[str, dict[str, Any]],
+    line: str,
+    annual: bool = True,
+) -> pd.DataFrame:
+    key = next(
+        (key for _, label, key in STATEMENT_LINES if label == line),
+        "revenue",
+    )
+
+    rows = {}
+
+    for symbol, metrics in metrics_by_symbol.items():
+        if key == "gross_margin_series":
+            gross = metrics.get("gross")
+            revenue = metrics.get("revenue")
+
+            if isinstance(gross, pd.Series) and isinstance(revenue, pd.Series):
+                series = (
+                    gross
+                    .divide(
+                        revenue.reindex(gross.index),
+                        fill_value=np.nan,
+                    )
+                    * 100
+                )
+            else:
+                series = pd.Series(dtype=float)
+
+        elif key == "operating_margin_series":
+            operating = metrics.get("operating")
+            revenue = metrics.get("revenue")
+
+            if isinstance(operating, pd.Series) and isinstance(revenue, pd.Series):
+                series = (
+                    operating
+                    .divide(
+                        revenue.reindex(operating.index),
+                        fill_value=np.nan,
+                    )
+                    * 100
+                )
+            else:
+                series = pd.Series(dtype=float)
+        else:
+            series = metrics.get(key)
+
+        if isinstance(series, pd.Series) and not series.empty:
+            series = series[~series.index.duplicated(keep="last")]
+            series = series.sort_index()
+
+            rows[symbol] = (
+                series.groupby(series.index.year).last()
+                if annual
+                else series.groupby(series.index.to_period("Q")).last()
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(rows).T
+    frame.loc["Industry average"] = frame.mean(axis=0)
+
+    return frame
+comparison_metrics = {
+    symbol: financial_metrics,
+    **peer_financial_metrics,
+}
+
+comparison = peer_metric_frame_from_metrics(
+    comparison_metrics,
+    selected_line,
+    annual=annual_view,
+)
+
             if not comparison.empty:
                 latest_column = comparison.columns[-1]
                 chart_values = comparison[latest_column].rename("Latest reported value").to_frame()
