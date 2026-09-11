@@ -1277,281 +1277,253 @@ def roaring_kitty_comparables(
     symbol: str,
     metrics: dict[str, Any],
     extra: dict[str, Any],
+    insider_df: pd.DataFrame | None = None,
 ) -> dict[str, Any]:
-    """Calculate Roaring Kitty-style insider and value metrics."""
+    """Build Roaring Kitty-style comparable metrics for one company."""
 
-    result = {
-        "Insider purchases (1M)": np.nan,
-        "Insider purchases (6M)": np.nan,
-        "<1 week insider purchase ($k)": np.nan,
-        "1-2 week insider purchase ($k)": np.nan,
-        "2-4 week insider purchase ($k)": np.nan,
-        "3M insider purchase ($k)": np.nan,
-        "12M insider purchase ($k)": np.nan,
-        "Sales / Price": np.nan,
-        "EBITDA / EV": np.nan,
-        "Tangible Book / Price": np.nan,
-        "Book Value / Price": np.nan,
-        "Net Income / Price": np.nan,
-        "Operating Cash Flow / Price": np.nan,
-        "Simple Free Cash Flow / Price": np.nan,
-        "Net Cash Flow / Price": np.nan,
-        "Div / Price": np.nan,
-        "Cash / Price": np.nan,
-        "Net Cash / Price": np.nan,
-    }
+    def latest(series):
+        if isinstance(series, pd.Series) and not series.empty:
+            series = series.dropna()
+            if not series.empty:
+                return float(series.iloc[-1])
+        return None
 
+    def safe_ratio(numerator, denominator):
+        if numerator is None or denominator in (None, 0):
+            return None
+        try:
+            return float(numerator / denominator)
+        except (TypeError, ValueError, ZeroDivisionError):
+            return None
+
+    # -----------------------------
+    # Fundamental values
+    # -----------------------------
+    revenue = latest(metrics.get("revenue"))
+    ebitda = latest(metrics.get("ebitda"))
+    book_value = latest(metrics.get("book_value"))
+    tangible_book = latest(metrics.get("tangible_book"))
+    net_income = latest(
+        metrics.get("net_income")
+        if isinstance(metrics.get("net_income"), pd.Series)
+        else metrics.get("net")
+    )
+    cfo = latest(metrics.get("cfo"))
+    capex = latest(metrics.get("capex"))
+    net_cash_flow = latest(metrics.get("net_cash_flow"))
+    dividends = latest(metrics.get("dividends"))
+    cash = latest(metrics.get("cash"))
+    debt = latest(metrics.get("debt"))
+
+    # SEC capex is commonly reported as a negative cash outflow.
+    # FCF therefore uses CFO + CapEx rather than CFO - CapEx.
+    if cfo is not None and capex is not None:
+        simple_fcf = cfo + capex
+    else:
+        simple_fcf = None
+
+    # Enterprise value = market cap + debt - cash.
     market_cap = extra.get("market_cap")
+    ev = None
+    if market_cap is not None:
+        ev = float(market_cap)
+        if debt is not None:
+            ev += debt
+        if cash is not None:
+            ev -= cash
 
-    try:
-        market_cap = float(market_cap) if market_cap else None
-    except (TypeError, ValueError):
-        market_cap = None
+    # Price-based denominator expressed as market capitalization.
+    # These are effectively "financial value / market cap" ratios.
+    mc = float(market_cap) if market_cap not in (None, 0) else None
 
-    # ---------------------------------------------------------
-    # Insider purchases
-    # ---------------------------------------------------------
-    try:
-        insider = openinsider_table(symbol)
+    # -----------------------------
+    # Insider purchase windows
+    # -----------------------------
+    insider_1m_count = 0
+    insider_6m_count = 0
+    insider_1w = 0.0
+    insider_2w = 0.0
+    insider_4w = 0.0
+    insider_3m = 0.0
+    insider_12m = 0.0
 
-        if insider is None or insider.empty:
-            insider = insider_trades(symbol)
+    if isinstance(insider_df, pd.DataFrame) and not insider_df.empty:
+        df = insider_df.copy()
 
-        if insider is not None and not insider.empty:
-            insider = insider.copy()
+        # Normalize date.
+        date_col = next(
+            (
+                col
+                for col in df.columns
+                if str(col).lower() in {
+                    "date",
+                    "transaction date",
+                    "start date",
+                    "datetime",
+                }
+            ),
+            None,
+        )
 
-            date_col = next(
+        if date_col is not None:
+            df["_rk_date"] = pd.to_datetime(
+                df[date_col],
+                errors="coerce",
+            )
+
+            df = df.dropna(subset=["_rk_date"])
+
+            # Identify transaction type.
+            text_columns = [
+                col for col in df.columns
+                if df[col].dtype == "object"
+            ]
+
+            if text_columns:
+                df["_rk_text"] = (
+                    df[text_columns]
+                    .fillna("")
+                    .astype(str)
+                    .agg(" ".join, axis=1)
+                    .str.lower()
+                )
+            else:
+                df["_rk_text"] = ""
+
+            purchase_mask = (
+                df["_rk_text"].str.contains(
+                    r"\bbuy\b|\bpurchase\b|\bacquisition\b|\bopen market buy\b",
+                    regex=True,
+                    na=False,
+                )
+                & ~df["_rk_text"].str.contains(
+                    r"\bsale\b|\bsold\b|\bsell\b",
+                    regex=True,
+                    na=False,
+                )
+            )
+
+            purchases = df.loc[purchase_mask].copy()
+
+            # Try to find a transaction-value column.
+            value_col = next(
                 (
-                    c for c in [
-                        "Date",
-                        "date",
-                        "Transaction Date",
-                        "Start Date",
-                    ]
-                    if c in insider.columns
+                    col
+                    for col in purchases.columns
+                    if str(col).lower().replace(" ", "").replace("_", "") in {
+                        "value",
+                        "transactionvalue",
+                        "transactionvalueusd",
+                        "totalvalue",
+                        "amount",
+                    }
                 ),
                 None,
             )
 
-            if date_col:
-                insider["_date"] = pd.to_datetime(
-                    insider[date_col],
+            if value_col is not None:
+                purchases["_rk_value"] = pd.to_numeric(
+                    purchases[value_col],
                     errors="coerce",
-                )
-
-                insider = insider.dropna(subset=["_date"])
-
-                # Search all textual columns for transaction type.
-                text_columns = [
-                    c for c in insider.columns
-                    if insider[c].dtype == "object"
-                ]
-
-                if text_columns:
-                    transaction_text = (
-                        insider[text_columns]
-                        .fillna("")
-                        .astype(str)
-                        .agg(" ".join, axis=1)
-                        .str.lower()
-                    )
-                else:
-                    transaction_text = pd.Series(
-                        "",
-                        index=insider.index,
-                    )
-
-                purchase_mask = (
-                    transaction_text.str.contains(
-                        r"\bbuy\b|\bbought\b|\bpurchase\b|open market",
-                        regex=True,
-                        na=False,
-                    )
-                    & ~transaction_text.str.contains(
-                        r"\bsale\b|\bsold\b",
-                        regex=True,
-                        na=False,
-                    )
-                )
-
-                purchases = insider.loc[purchase_mask].copy()
-
-                value_col = next(
+                ).fillna(0)
+            else:
+                # Try Shares × Price if transaction value is not supplied.
+                shares_col = next(
                     (
-                        c for c in [
-                            "Value",
-                            "Transaction Value",
-                            "Value ($)",
-                            "Total Value",
-                            "Amount",
-                            "Transaction Value ($)",
-                        ]
-                        if c in purchases.columns
+                        col for col in purchases.columns
+                        if "share" in str(col).lower()
+                        and "price" not in str(col).lower()
+                    ),
+                    None,
+                )
+                price_col = next(
+                    (
+                        col for col in purchases.columns
+                        if "price" in str(col).lower()
                     ),
                     None,
                 )
 
-                if value_col:
-                    purchases["_value"] = pd.to_numeric(
-                        purchases[value_col]
-                        .astype(str)
-                        .str.replace("$", "", regex=False)
-                        .str.replace(",", "", regex=False)
-                        .str.replace("(", "-", regex=False)
-                        .str.replace(")", "", regex=False),
-                        errors="coerce",
+                if shares_col and price_col:
+                    purchases["_rk_value"] = (
+                        pd.to_numeric(
+                            purchases[shares_col],
+                            errors="coerce",
+                        ).fillna(0)
+                        * pd.to_numeric(
+                            purchases[price_col],
+                            errors="coerce",
+                        ).fillna(0)
                     )
                 else:
-                    purchases["_value"] = np.nan
+                    purchases["_rk_value"] = 0.0
 
-                now = pd.Timestamp.now().normalize()
+            now = pd.Timestamp.now(tz=None)
 
-                def recent(days: int) -> pd.DataFrame:
-                    return purchases[
-                        (purchases["_date"] >= now - pd.Timedelta(days=days))
-                        & (purchases["_date"] <= now)
-                    ]
+            def window(days):
+                cutoff = now - pd.Timedelta(days=days)
+                return purchases[purchases["_rk_date"] >= cutoff]
 
-                one_month = recent(30)
-                six_month = recent(180)
+            one_month = window(30)
+            six_month = window(180)
+            three_month = window(90)
+            twelve_month = window(365)
 
-                result["Insider purchases (1M)"] = len(one_month)
-                result["Insider purchases (6M)"] = len(six_month)
+            insider_1m_count = int(len(one_month))
+            insider_6m_count = int(len(six_month))
 
-                result["<1 week insider purchase ($k)"] = (
-                    recent(7)["_value"].sum() / 1_000
-                )
-
-                result["1-2 week insider purchase ($k)"] = (
-                    (
-                        recent(14)
-                        .loc[
-                            lambda x: x["_date"]
-                            < now - pd.Timedelta(days=7)
-                        ]["_value"]
-                        .sum()
-                    )
-                    / 1_000
-                )
-
-                result["2-4 week insider purchase ($k)"] = (
-                    (
-                        recent(28)
-                        .loc[
-                            lambda x: x["_date"]
-                            < now - pd.Timedelta(days=14)
-                        ]["_value"]
-                        .sum()
-                    )
-                    / 1_000
-                )
-
-                result["3M insider purchase ($k)"] = (
-                    recent(90)["_value"].sum() / 1_000
-                )
-
-                result["12M insider purchase ($k)"] = (
-                    recent(365)["_value"].sum() / 1_000
-                )
-
-    except Exception:
-        pass
-
-    # ---------------------------------------------------------
-    # Financial values
-    # ---------------------------------------------------------
-    revenue = latest_metric(metrics, "revenue")
-    ebitda = latest_metric(metrics, "ebitda")
-    tangible_book = latest_metric(metrics, "tangible_book")
-    book_value = latest_metric(metrics, "book_value")
-    net_income = latest_metric(metrics, "net_income")
-    cfo = latest_metric(metrics, "cfo")
-    capex = latest_metric(metrics, "capex")
-    net_cash_flow = latest_metric(metrics, "net_cash_flow")
-    dividends = latest_metric(metrics, "dividends")
-
-    cash = latest_metric(metrics, "cash")
-    debt = latest_metric(metrics, "debt")
-
-    # Prefer enrichment values where available.
-    if extra.get("cash") is not None:
-        cash = float(extra["cash"])
-
-    if extra.get("debt") is not None:
-        debt = float(extra["debt"])
-
-    # ---------------------------------------------------------
-    # Sales / Price
-    # ---------------------------------------------------------
-    if revenue is not None and market_cap:
-        result["Sales / Price"] = revenue / market_cap
-
-    # ---------------------------------------------------------
-    # EBITDA / EV
-    # ---------------------------------------------------------
-    if market_cap:
-        enterprise_value = market_cap + (debt or 0) - (cash or 0)
-
-        if ebitda is not None and enterprise_value > 0:
-            result["EBITDA / EV"] = (
-                ebitda / enterprise_value
+            # Most recent transaction first.
+            insider_1w = float(
+                window(7)["_rk_value"].sum() / 1000
+            )
+            insider_2w = float(
+                (
+                    window(14)["_rk_value"].sum()
+                    - window(7)["_rk_value"].sum()
+                ) / 1000
+            )
+            insider_4w = float(
+                (
+                    window(28)["_rk_value"].sum()
+                    - window(14)["_rk_value"].sum()
+                ) / 1000
+            )
+            insider_3m = float(
+                three_month["_rk_value"].sum() / 1000
+            )
+            insider_12m = float(
+                twelve_month["_rk_value"].sum() / 1000
             )
 
-    # ---------------------------------------------------------
-    # Equity-value ratios
-    # ---------------------------------------------------------
-    if market_cap:
-        if tangible_book is not None:
-            result["Tangible Book / Price"] = (
-                tangible_book / market_cap
-            )
+    return {
+        "Symbol": symbol,
 
-        if book_value is not None:
-            result["Book Value / Price"] = (
-                book_value / market_cap
-            )
+        "# insider purchase · 1m": insider_1m_count,
+        "# insider purchase · 6m": insider_6m_count,
 
-        if net_income is not None:
-            result["Net Income / Price"] = (
-                net_income / market_cap
-            )
+        "<1 week insider purchase ($k)": insider_1w,
+        "1–2 week insider purchase ($k)": insider_2w,
+        "2–4 week insider purchase ($k)": insider_4w,
+        "3m insider purchase ($k)": insider_3m,
+        "12m insider purchase ($k)": insider_12m,
 
-        if cfo is not None:
-            result["Operating Cash Flow / Price"] = (
-                cfo / market_cap
-            )
-
-        if cfo is not None and capex is not None:
-            # Capex is usually reported as a negative cash-flow value.
-            simple_fcf = cfo - abs(capex)
-
-            result["Simple Free Cash Flow / Price"] = (
-                simple_fcf / market_cap
-            )
-
-        if net_cash_flow is not None:
-            result["Net Cash Flow / Price"] = (
-                net_cash_flow / market_cap
-            )
-
-        if dividends is not None:
-            result["Div / Price"] = (
-                abs(dividends) / market_cap
-            )
-
-        if cash is not None:
-            result["Cash / Price"] = (
-                cash / market_cap
-            )
-
-        if cash is not None:
-            net_cash = cash - (debt or 0)
-
-            result["Net Cash / Price"] = (
-                net_cash / market_cap
-            )
-
-    return result
+        "Sales / Price": safe_ratio(revenue, mc),
+        "EBITDA / EV": safe_ratio(ebitda, ev),
+        "Tangible Book / Price": safe_ratio(tangible_book, mc),
+        "Book Value / Price": safe_ratio(book_value, mc),
+        "Net Income / Price": safe_ratio(net_income, mc),
+        "Operating Cash Flow / Price": safe_ratio(cfo, mc),
+        "Simple FCF / Price": safe_ratio(simple_fcf, mc),
+        "Net Cash Flow / Price": safe_ratio(net_cash_flow, mc),
+        "Div / Price": safe_ratio(dividends, mc),
+        "Cash / Price": safe_ratio(cash, mc),
+        "Net Cash / Price": safe_ratio(
+            (cash - debt)
+            if cash is not None and debt is not None
+            else None,
+            mc,
+        ),
+    }
 
 
 
@@ -2016,451 +1988,611 @@ def main() -> None:
                 use_container_width=True,
             )
 
-        # ------------------------------------------------------------
-        # COMPARABLE VALUATION MULTIPLES
-        # ------------------------------------------------------------
+            # ------------------------------------------------------------
+            # COMPARABLE VALUATION MULTIPLES
+            # ------------------------------------------------------------
 
-        st.markdown("**Comparable valuation multiples**")
-
-        valuation_comparison = valuation_frame(
-            [symbol] + peers
-        )
-
-        st.dataframe(
-            style_valuation_table(
-                valuation_comparison,
+            # ============================================================
+            # ROARING KITTY COMPARABLES
+            # ============================================================
+            st.markdown("**Roaring Kitty Comparables**")
+        
+            # Build insider transaction data for the selected stock.
+            try:
+                rk_insider = openinsider_table(symbol)
+            except Exception:
+                rk_insider = pd.DataFrame()
+        
+            if rk_insider is None or rk_insider.empty:
+                try:
+                    rk_insider = insider_trades(symbol)
+                except Exception:
+                    rk_insider = pd.DataFrame()
+        
+            # Build comparable metrics for the selected stock.
+            rk_company = roaring_kitty_comparables(
                 symbol,
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ------------------------------------------------------------
-        # DCF WORKSPACE
-        # ------------------------------------------------------------
-
-        st.markdown("**DCF workspace**")
-
-        analyst_growth = (
-            pct(extra.get("analyst_growth"))
-            or 12.0
-        )
-
-        consensus_target = extra.get("target")
-
-        assumptions = st.columns(5)
-
-        revenue_growth = assumptions[0].number_input(
-            "Revenue growth %",
-            value=float(analyst_growth),
-            key="dcf_growth",
-        )
-
-        margin = assumptions[1].number_input(
-            "Operating margin %",
-            value=float(
-                metrics.get("operating_margin")
-                or 20
-            ),
-            key="dcf_margin",
-        )
-
-        wacc = assumptions[2].number_input(
-            "WACC %",
-            value=9.0,
-            key="dcf_wacc",
-        )
-
-        terminal = assumptions[3].number_input(
-            "Terminal growth %",
-            value=3.0,
-            key="dcf_terminal",
-        )
-
-        shares = assumptions[4].number_input(
-            "Shares (mm)",
-            value=(
-                float(
-                    metrics["shares"].iloc[-1]
-                    / 1_000_000
-                )
-                if (
-                    isinstance(
-                        metrics.get("shares"),
-                        pd.Series,
-                    )
-                    and not metrics["shares"].empty
-                )
-                else 1.0
-            ),
-            key="dcf_shares",
-        )
-
-        st.caption(
-            f"Analyst consensus growth used to prefill: "
-            f"{analyst_growth:.1f}%. "
-            f"Company guidance: "
-            f"{extra.get('guidance') or 'Not available from the current source.'}"
-        )
-
-        base = ttm(metrics.get("revenue"))
-        base_cogs = ttm(metrics.get("cogs"))
-        base_rd = ttm(metrics.get("rd"))
-        base_ga = ttm(metrics.get("ga"))
-        base_interest = ttm(metrics.get("interest"))
-        base_cfo = ttm(metrics.get("cfo"))
-        base_capex = ttm(metrics.get("capex"))
-
-        years = np.arange(0, 6)
-
-        forecast = pd.DataFrame(
-            {
-                "Year": (
-                    ["Y0 Actuals"]
-                    + [f"Y{i}" for i in range(1, 6)]
-                )
-            }
-        )
-
-        forecast["Revenue"] = [
-            base * (
-                1 + revenue_growth / 100
-            ) ** i
-            for i in years
-        ]
-
-        forecast["COGS"] = (
-            forecast.Revenue
-            * (
-                base_cogs / base
-                if base
-                else (
-                    1
-                    - (
-                        metrics.get(
-                            "gross_margin"
+                metrics,
+                extra,
+                rk_insider,
+            )
+        
+            # Build comparable metrics for each peer.
+            rk_peer_rows = []
+        
+            for peer in peers:
+                try:
+                    peer_metrics = financial_metrics.get(peer)
+        
+                    if peer_metrics is None:
+                        if financial_source == "Yahoo Finance":
+                            peer_metrics = yahoo_statement_metrics(peer)
+                        else:
+                            peer_metrics = filing_metrics(peer)
+        
+                    try:
+                        peer_extra = enrichment(peer)
+                    except Exception:
+                        peer_extra = {}
+        
+                    try:
+                        peer_insider = openinsider_table(peer)
+                    except Exception:
+                        peer_insider = pd.DataFrame()
+        
+                    if peer_insider is None or peer_insider.empty:
+                        try:
+                            peer_insider = insider_trades(peer)
+                        except Exception:
+                            peer_insider = pd.DataFrame()
+        
+                    rk_peer_rows.append(
+                        roaring_kitty_comparables(
+                            peer,
+                            peer_metrics,
+                            peer_extra,
+                            peer_insider,
                         )
-                        or 50
                     )
-                    / 100
+        
+                except Exception:
+                    # Keep the table alive even if one peer has incomplete data.
+                    rk_peer_rows.append(
+                        roaring_kitty_comparables(
+                            peer,
+                            {},
+                            {},
+                            pd.DataFrame(),
+                        )
+                    )
+        
+            rk_columns = [
+                "# insider purchase · 1m",
+                "# insider purchase · 6m",
+                "<1 week insider purchase ($k)",
+                "1–2 week insider purchase ($k)",
+                "2–4 week insider purchase ($k)",
+                "3m insider purchase ($k)",
+                "12m insider purchase ($k)",
+                "Sales / Price",
+                "EBITDA / EV",
+                "Tangible Book / Price",
+                "Book Value / Price",
+                "Net Income / Price",
+                "Operating Cash Flow / Price",
+                "Simple FCF / Price",
+                "Net Cash Flow / Price",
+                "Div / Price",
+                "Cash / Price",
+                "Net Cash / Price",
+            ]
+        
+            rk_rows = [rk_company] + rk_peer_rows
+            rk_table = pd.DataFrame(rk_rows)
+        
+            # Industry average = average of peers only.
+            # This prevents the selected company from influencing its own
+            # industry-average comparison.
+            if rk_peer_rows:
+                peer_only = pd.DataFrame(rk_peer_rows)
+        
+                industry_average = {
+                    "Symbol": "Industry average",
+                }
+        
+                for column in rk_columns:
+                    if column in peer_only.columns:
+                        values = pd.to_numeric(
+                            peer_only[column],
+                            errors="coerce",
+                        )
+        
+                        industry_average[column] = (
+                            float(values.mean())
+                            if values.notna().any()
+                            else np.nan
+                        )
+        
+                rk_table = pd.concat(
+                    [
+                        rk_table,
+                        pd.DataFrame([industry_average]),
+                    ],
+                    ignore_index=True,
+                )
+        
+            # Put selected stock first, then peers, then industry average.
+            rk_table = rk_table[
+                ["Symbol"] + [
+                    column for column in rk_columns
+                    if column in rk_table.columns
+                ]
+            ]
+        
+            # Display insider purchase counts as whole numbers and financial
+            # ratios as percentages.
+            rk_display = rk_table.copy()
+        
+            for column in [
+                "# insider purchase · 1m",
+                "# insider purchase · 6m",
+            ]:
+                if column in rk_display.columns:
+                    rk_display[column] = pd.to_numeric(
+                        rk_display[column],
+                        errors="coerce",
+                    ).round(0)
+        
+            for column in [
+                "<1 week insider purchase ($k)",
+                "1–2 week insider purchase ($k)",
+                "2–4 week insider purchase ($k)",
+                "3m insider purchase ($k)",
+                "12m insider purchase ($k)",
+            ]:
+                if column in rk_display.columns:
+                    rk_display[column] = pd.to_numeric(
+                        rk_display[column],
+                        errors="coerce",
+                    ).round(1)
+        
+            ratio_columns = [
+                "Sales / Price",
+                "EBITDA / EV",
+                "Tangible Book / Price",
+                "Book Value / Price",
+                "Net Income / Price",
+                "Operating Cash Flow / Price",
+                "Simple FCF / Price",
+                "Net Cash Flow / Price",
+                "Div / Price",
+                "Cash / Price",
+                "Net Cash / Price",
+            ]
+        
+            for column in ratio_columns:
+                if column in rk_display.columns:
+                    rk_display[column] = (
+                        pd.to_numeric(
+                            rk_display[column],
+                            errors="coerce",
+                        )
+                        * 100
+                    ).round(2)
+        
+            st.caption(
+                "Roaring Kitty Comparables combines recent insider purchase activity "
+                "with cash-flow, earnings, book-value and balance-sheet ratios. "
+                "Price-based metrics are expressed as the underlying financial "
+                "value divided by market capitalization; EBITDA / EV uses enterprise value."
+            )
+        
+            st.dataframe(
+                rk_display.style.format(
+                    {
+                        "# insider purchase · 1m": "{:,.0f}",
+                        "# insider purchase · 6m": "{:,.0f}",
+                        "<1 week insider purchase ($k)": "{:,.1f}",
+                        "1–2 week insider purchase ($k)": "{:,.1f}",
+                        "2–4 week insider purchase ($k)": "{:,.1f}",
+                        "3m insider purchase ($k)": "{:,.1f}",
+                        "12m insider purchase ($k)": "{:,.1f}",
+                        "Sales / Price": "{:.2f}%",
+                        "EBITDA / EV": "{:.2f}%",
+                        "Tangible Book / Price": "{:.2f}%",
+                        "Book Value / Price": "{:.2f}%",
+                        "Net Income / Price": "{:.2f}%",
+                        "Operating Cash Flow / Price": "{:.2f}%",
+                        "Simple FCF / Price": "{:.2f}%",
+                        "Net Cash Flow / Price": "{:.2f}%",
+                        "Div / Price": "{:.2f}%",
+                        "Cash / Price": "{:.2f}%",
+                        "Net Cash / Price": "{:.2f}%",
+                    }
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        
+            # ============================================================
+            # COMPARABLE VALUATION MULTIPLES
+            # ============================================================
+            st.markdown("**Comparable valuation multiples**")
+        
+            st.dataframe(
+                style_valuation_table(
+                    valuation_frame([symbol] + peers),
+                    symbol,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        
+            # ============================================================
+            # DCF WORKSPACE
+            # ============================================================
+            st.markdown("**DCF workspace**")
+        
+            analyst_growth = pct(extra.get("analyst_growth")) or 12.0
+            consensus_target = extra.get("target")
+        
+            assumptions = st.columns(5)
+        
+            revenue_growth = assumptions[0].number_input(
+                "Revenue growth %",
+                value=float(analyst_growth),
+                key="dcf_growth",
+            )
+        
+            margin = assumptions[1].number_input(
+                "Operating margin %",
+                value=float(metrics.get("operating_margin") or 20),
+                key="dcf_margin",
+            )
+        
+            wacc = assumptions[2].number_input(
+                "WACC %",
+                value=9.0,
+                key="dcf_wacc",
+            )
+        
+            terminal = assumptions[3].number_input(
+                "Terminal growth %",
+                value=3.0,
+                key="dcf_terminal",
+            )
+        
+            shares_series = metrics.get("shares")
+        
+            if (
+                isinstance(shares_series, pd.Series)
+                and not shares_series.empty
+            ):
+                shares_default = float(
+                    shares_series.iloc[-1] / 1_000_000
+                )
+            else:
+                shares_default = 1.0
+        
+            shares = assumptions[4].number_input(
+                "Shares (mm)",
+                value=shares_default,
+                key="dcf_shares",
+            )
+        
+            st.caption(
+                f"Analyst consensus growth used to prefill: "
+                f"{analyst_growth:.1f}%. "
+                f"Company guidance: "
+                f"{extra.get('guidance') or 'Not available from the current source.'}"
+            )
+        
+            base = ttm(metrics.get("revenue"))
+            base_cogs = ttm(metrics.get("cogs"))
+            base_rd = ttm(metrics.get("rd"))
+            base_ga = ttm(metrics.get("ga"))
+            base_interest = ttm(metrics.get("interest"))
+            base_cfo = ttm(metrics.get("cfo"))
+            base_capex = ttm(metrics.get("capex"))
+        
+            years = np.arange(0, 6)
+        
+            forecast = pd.DataFrame(
+                {
+                    "Year": ["Y0 Actuals"] + [
+                        f"Y{i}" for i in range(1, 6)
+                    ]
+                }
+            )
+        
+            forecast["Revenue"] = [
+                base * (1 + revenue_growth / 100) ** i
+                for i in years
+            ]
+        
+            forecast["COGS"] = (
+                forecast.Revenue
+                * (
+                    base_cogs / base
+                    if base
+                    else (
+                        1
+                        - (metrics.get("gross_margin") or 50) / 100
+                    )
                 )
             )
-        )
-
-        forecast["Gross Profit"] = (
-            forecast["Revenue"]
-            - forecast["COGS"]
-        )
-
-        forecast["R&D"] = (
-            forecast["Revenue"]
-            * (
+        
+            forecast["Gross Profit"] = (
+                forecast["Revenue"] - forecast["COGS"]
+            )
+        
+            forecast["R&D"] = forecast.Revenue * (
                 base_rd / base
                 if base and base_rd
                 else 0.08
             )
-        )
-
-        forecast["G&A"] = (
-            forecast["Revenue"]
-            * (
+        
+            forecast["G&A"] = forecast.Revenue * (
                 base_ga / base
                 if base and base_ga
                 else 0.10
             )
-        )
-
-        forecast["Total Operating Expenses"] = (
-            forecast["R&D"]
-            + forecast["G&A"]
-        )
-
-        forecast["Operating Income"] = (
-            forecast["Revenue"]
-            * margin
-            / 100
-        )
-
-        forecast["Interest Income"] = (
-            forecast["Revenue"]
-            * (
+        
+            forecast["Total Operating Expenses"] = (
+                forecast["R&D"] + forecast["G&A"]
+            )
+        
+            forecast["Operating Income"] = (
+                forecast.Revenue * margin / 100
+            )
+        
+            forecast["Interest Income"] = forecast.Revenue * (
                 base_interest / base
                 if base and base_interest
                 else 0.005
             )
-        )
-
-        forecast["Pretax Income"] = (
-            forecast["Operating Income"]
-            + forecast["Interest Income"]
-        )
-
-        forecast["Taxes"] = (
-            forecast["Pretax Income"]
-            * 0.21
-        )
-
-        forecast["Net Income"] = (
-            forecast["Pretax Income"]
-            - forecast["Taxes"]
-        )
-
-        forecast["EPS"] = (
-            forecast["Net Income"]
-            / max(shares, 1e-9)
-            / 1_000_000
-        )
-
-        forecast["Free Cash Flow"] = (
-            [base_cfo - base_capex]
-            + [
-                max(
-                    float(
-                        forecast.loc[
-                            i,
-                            "Net Income",
-                        ]
-                    ),
-                    0,
-                )
-                for i in range(1, 6)
-            ]
-        )
-
-        amount_columns = [
-            column
-            for column in forecast.columns
-            if column not in {"Year", "EPS"}
-        ]
-
-        forecast_display = forecast.copy()
-
-        forecast_display[amount_columns] = (
-            forecast_display[amount_columns]
-            / 1_000_000
-        )
-
-        forecast_table = (
-            forecast_display
-            .set_index("Year")
-            .T
-        )
-
-        st.dataframe(
-            forecast_table.style.format(
-                {
-                    column: "{:,.1f}"
-                    for column in forecast_table.columns
-                    if column != "EPS"
-                }
-                | (
-                    {"EPS": "{:,.2f}"}
-                    if "EPS" in forecast_table.index
-                    else {}
-                )
-            ),
-            use_container_width=True,
-        )
-
-        fcf_forecast = (
-            forecast.loc[
-                1:,
-                "Free Cash Flow",
-            ]
-            .to_numpy(dtype=float)
-        )
-
-        discount_rate = max(
-            wacc / 100,
-            terminal / 100 + 0.01,
-        )
-
-        terminal_value = (
-            fcf_forecast[-1]
-            * (1 + terminal / 100)
-            / (
-                discount_rate
-                - terminal / 100
+        
+            forecast["Pretax Income"] = (
+                forecast["Operating Income"]
+                + forecast["Interest Income"]
             )
-            if fcf_forecast.size
-            else 0
-        )
-
-        pv_equity = (
-            float(
-                (
-                    fcf_forecast
-                    / (
-                        1 + discount_rate
+        
+            forecast["Taxes"] = forecast["Pretax Income"] * 0.21
+            forecast["Net Income"] = (
+                forecast["Pretax Income"] - forecast["Taxes"]
+            )
+        
+            forecast["EPS"] = (
+                forecast["Net Income"]
+                / max(shares, 1e-9)
+                / 1_000_000
+            )
+        
+            forecast["Free Cash Flow"] = (
+                [base_cfo - base_capex]
+                + [
+                    max(
+                        float(forecast.loc[i, "Net Income"]),
+                        0,
                     )
-                    ** np.arange(1, 6)
-                ).sum()
-                + terminal_value
-                / (
-                    1 + discount_rate
-                ) ** 5
-                + (extra.get("cash") or 0)
-                - (extra.get("debt") or 0)
+                    for i in range(1, 6)
+                ]
             )
-            if base and shares
-            else 0
-        )
-
-        dcf_price = (
-            pv_equity
-            / (shares * 1_000_000)
-            if shares
-            else None
-        )
-
-        dcf_upside = (
-            dcf_price / current_price - 1
-            if dcf_price and current_price
-            else None
-        )
-
-        consensus_upside = (
-            consensus_target / current_price - 1
-            if consensus_target and current_price
-            else None
-        )
-
-        st.caption(
-            f"Editable DCF output: {fmt(dcf_price)} "
-            "per share. The headline DCF and analyst "
-            "consensus metrics remain at the top of this tab."
-        )
-
-        # ------------------------------------------------------------
-        # INSIDER TRANSACTIONS
-        # ------------------------------------------------------------
-
-        st.markdown("**Insider transactions**")
-
-        openinsider = openinsider_table(symbol)
-
-        if not openinsider.empty:
-            st.caption("Source: OpenInsider")
-
+        
+            amount_columns = [
+                column
+                for column in forecast.columns
+                if column not in {"Year", "EPS"}
+            ]
+        
+            forecast_display = forecast.copy()
+        
+            forecast_display[amount_columns] = (
+                forecast_display[amount_columns] / 1_000_000
+            )
+        
+            forecast_table = forecast_display.set_index("Year").T
+        
             st.dataframe(
-                style_insider_table(
-                    openinsider,
-                    extra.get("market_cap"),
+                forecast_table.style.format(
+                    {
+                        column: "{:,.1f}"
+                        for column in forecast_table.columns
+                        if column != "EPS"
+                    }
+                    | (
+                        {"EPS": "{:,.2f}"}
+                        if "EPS" in forecast_table.index
+                        else {}
+                    )
                 ),
                 use_container_width=True,
-                hide_index=True,
             )
-
-        else:
-            insider_table = insider_trades(symbol)
-
+        
+            fcf_forecast = forecast.loc[
+                1:,
+                "Free Cash Flow",
+            ].to_numpy(dtype=float)
+        
+            discount_rate = max(
+                wacc / 100,
+                terminal / 100 + 0.01,
+            )
+        
+            terminal_value = (
+                fcf_forecast[-1]
+                * (1 + terminal / 100)
+                / (discount_rate - terminal / 100)
+                if fcf_forecast.size
+                else 0
+            )
+        
+            pv_equity = (
+                float(
+                    (
+                        fcf_forecast
+                        / (1 + discount_rate)
+                        ** np.arange(1, 6)
+                    ).sum()
+                    + terminal_value
+                    / (1 + discount_rate) ** 5
+                    + (extra.get("cash") or 0)
+                    - (extra.get("debt") or 0)
+                )
+                if base and shares
+                else 0
+            )
+        
+            dcf_price = (
+                pv_equity / (shares * 1_000_000)
+                if shares
+                else None
+            )
+        
+            dcf_upside = (
+                dcf_price / current_price - 1
+                if dcf_price and current_price
+                else None
+            )
+        
+            consensus_upside = (
+                consensus_target / current_price - 1
+                if consensus_target and current_price
+                else None
+            )
+        
             st.caption(
-                "OpenInsider was unavailable; using the available "
-                "Yahoo Finance insider feed."
+                f"Editable DCF output: {fmt(dcf_price)} per share. "
+                "The headline DCF and analyst consensus metrics remain at "
+                "the top of this tab."
             )
-
-            st.dataframe(
-                style_insider_table(
-                    insider_table.sort_values(
+        
+            # ============================================================
+            # INSIDER TRANSACTIONS
+            # ============================================================
+            st.markdown("**Insider transactions**")
+        
+            openinsider = openinsider_table(symbol)
+        
+            if not openinsider.empty:
+                st.caption("Source: OpenInsider")
+        
+                st.dataframe(
+                    style_insider_table(
+                        openinsider,
+                        extra.get("market_cap"),
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+            else:
+                insider_table = insider_trades(symbol)
+        
+                st.caption(
+                    "OpenInsider was unavailable; using the available "
+                    "Yahoo Finance insider feed."
+                )
+        
+                st.dataframe(
+                    style_insider_table(
+                        insider_table.sort_values(
+                            "Date",
+                            ascending=False,
+                        ),
+                        extra.get("market_cap"),
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        
+            # ============================================================
+            # EARNINGS AND ANALYST ACTIONS
+            # ============================================================
+            st.markdown("**Earnings and analyst actions**")
+        
+            earnings_table = earnings_history(symbol)
+        
+            if not earnings_table.empty:
+                keep = [
+                    column
+                    for column in [
+                        "Date",
+                        "Reported EPS",
+                        "EPS Estimate",
+                        "Surprise(%)",
+                    ]
+                    if column in earnings_table.columns
+                ]
+        
+                st.dataframe(
+                    earnings_table[keep].sort_values(
                         "Date",
                         ascending=False,
                     ),
-                    extra.get("market_cap"),
-                ),
-                use_container_width=True,
-                hide_index=True,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        
+            actions_table = normalize_actions(
+                analyst_actions(symbol)
             )
-
-        # ------------------------------------------------------------
-        # EARNINGS AND ANALYST ACTIONS
-        # ------------------------------------------------------------
-
-        st.markdown("**Earnings and analyst actions**")
-
-        earnings_table = earnings_history(symbol)
-
-        if not earnings_table.empty:
-            keep = [
-                column
-                for column in [
-                    "Date",
-                    "Reported EPS",
-                    "EPS Estimate",
-                    "Surprise(%)",
-                ]
-                if column in earnings_table.columns
-            ]
-
-            st.dataframe(
-                earnings_table[keep].sort_values(
-                    "Date",
-                    ascending=False,
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        actions_table = normalize_actions(
-            analyst_actions(symbol)
-        )
-
-        if not actions_table.empty:
-            keep = [
-                column
-                for column in [
-                    "Date",
-                    "Firm",
-                    "Action",
-                    "To Grade",
-                    "From Grade",
-                    "Price target change",
-                ]
-                if column in actions_table.columns
-            ]
-
-            st.caption(
-                "Analyst actions are sourced from the available "
-                "Yahoo Finance feed; MarketWatch estimate and "
-                "analyst tables are shown below when available."
-            )
-
-            st.dataframe(
-                actions_table[keep].sort_values(
-                    "Date",
-                    ascending=False,
-                ),
-                use_container_width=True,
-                hide_index=True,
-            )
-
-        marketwatch = marketwatch_tables(symbol)
-
-        if marketwatch:
-            st.markdown(
-                "**MarketWatch EPS estimate trends and analyst tables**"
-            )
-
-            for index, table in enumerate(marketwatch):
-                text = " ".join(
-                    str(column)
-                    for column in table.columns
-                ).lower()
-
-                if any(
-                    token in text
-                    for token in [
-                        "estimate",
-                        "analyst",
-                        "consensus",
-                        "surprise",
+        
+            if not actions_table.empty:
+                keep = [
+                    column
+                    for column in [
+                        "Date",
+                        "Firm",
+                        "Action",
+                        "To Grade",
+                        "From Grade",
+                        "Price target change",
                     ]
-                ):
-                    st.dataframe(
-                        table,
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-
+                    if column in actions_table.columns
+                ]
+        
+                st.caption(
+                    "Analyst actions are sourced from the available "
+                    "Yahoo Finance feed; MarketWatch estimate and analyst "
+                    "tables are shown below when available."
+                )
+        
+                st.dataframe(
+                    actions_table[keep].sort_values(
+                        "Date",
+                        ascending=False,
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        
+            marketwatch = marketwatch_tables(symbol)
+        
+            if marketwatch:
+                st.markdown(
+                    "**MarketWatch EPS estimate trends and analyst tables**"
+                )
+        
+                for index, table in enumerate(marketwatch):
+                    text = " ".join(
+                        str(column)
+                        for column in table.columns
+                    ).lower()
+        
+                    if any(
+                        token in text
+                        for token in [
+                            "estimate",
+                            "analyst",
+                            "consensus",
+                            "surprise",
+                        ]
+                    ):
+                        st.dataframe(
+                            table,
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
 if __name__ == "__main__":
     main()
