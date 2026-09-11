@@ -181,8 +181,51 @@ def latest_yoy(series: pd.Series) -> float | None:
 
 
 def filing_metrics(symbol: str) -> dict[str, Any]:
-    @st.cache_data(ttl=3600, show_spinner=False)
+    bundle = sec_facts(symbol)
+    revenue = fact_series(bundle, ["RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues"])
+    eps = fact_series(bundle, ["EarningsPerShareDiluted", "EarningsPerShareBasic"], "USD/shares")
+    net = fact_series(bundle, ["NetIncomeLoss", "ProfitLoss"])
+    gross = fact_series(bundle, ["GrossProfit"])
+    operating = fact_series(bundle, ["OperatingIncomeLoss"])
+    cfo = fact_series(bundle, ["NetCashProvidedByUsedInOperatingActivities"])
+    result = {"cik": bundle.get("cik"), "name": bundle.get("name", symbol), "revenue": revenue, "eps": eps, "net": net, "gross": gross, "operating": operating, "cfo": cfo}
+    result.update({
+        "cogs": fact_series(bundle, ["CostOfRevenue", "CostOfGoodsAndServicesSold"]),
+        "rd": fact_series(bundle, ["ResearchAndDevelopmentExpense"]),
+        "ga": fact_series(bundle, ["SellingGeneralAndAdministrativeExpense"]),
+        "opex": fact_series(bundle, ["OperatingExpenses"]),
+        "interest": fact_series(bundle, ["InterestIncomeExpenseNonOperatingNet", "InterestExpenseNonOperating"]),
+        "pretax": fact_series(bundle, ["IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest", "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments"]),
+        "taxes": fact_series(bundle, ["IncomeTaxExpenseBenefit"]),
+        "shares": fact_series(bundle, ["WeightedAverageNumberOfDilutedSharesOutstanding", "EntityCommonStockSharesOutstanding"], "shares"),
+        "assets": fact_series(bundle, ["Assets"]),
+        "liabilities": fact_series(bundle, ["Liabilities"]),
+        "equity": fact_series(bundle, ["StockholdersEquity", "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"]),
+        "capex": fact_series(bundle, ["PaymentsToAcquirePropertyPlantAndEquipment", "PaymentsToAcquireProductiveAssets"]),
+        "cash": fact_series(bundle, ["CashAndCashEquivalentsAtCarryingValue", "CashCashEquivalentsRestrictedCashAndRestrictedCashEquivalents"]),
+        "receivables": fact_series(bundle, ["AccountsReceivableNetCurrent"]), "inventory": fact_series(bundle, ["InventoryNet"]), "prepaids": fact_series(bundle, ["PrepaidExpenseAndOtherAssetsCurrent"]), "current_assets": fact_series(bundle, ["AssetsCurrent"]),
+        "ppe": fact_series(bundle, ["PropertyPlantAndEquipmentNet"]), "lease_asset": fact_series(bundle, ["OperatingLeaseRightOfUseAsset"]), "deferred_tax_asset": fact_series(bundle, ["DeferredTaxAssetsNet"]), "other_assets": fact_series(bundle, ["OtherAssetsNoncurrent"]),
+        "payables": fact_series(bundle, ["AccountsPayableCurrent"]), "other_current_liabilities": fact_series(bundle, ["OtherLiabilitiesCurrent"]), "deferred_revenue": fact_series(bundle, ["ContractWithCustomerLiabilityCurrent"]), "tax_receivables": fact_series(bundle, ["IncomeTaxesReceivable"]), "current_lease": fact_series(bundle, ["OperatingLeaseLiabilityCurrent"]), "current_debt": fact_series(bundle, ["LongTermDebtCurrent"]), "current_liabilities": fact_series(bundle, ["LiabilitiesCurrent"]),
+        "long_term_lease": fact_series(bundle, ["OperatingLeaseLiabilityNoncurrent"]), "long_term_debt": fact_series(bundle, ["LongTermDebtNoncurrent"]), "other_liabilities": fact_series(bundle, ["OtherLiabilitiesNoncurrent"]), "preferred_stock": fact_series(bundle, ["PreferredStocksIncludingAdditionalPaidInCapital"]), "common_stock": fact_series(bundle, ["CommonStocksIncludingAdditionalPaidInCapital"]), "apic": fact_series(bundle, ["AdditionalPaidInCapital"]), "aoci": fact_series(bundle, ["AccumulatedOtherComprehensiveIncomeLossNetOfTax"]), "retained_earnings": fact_series(bundle, ["RetainedEarningsAccumulatedDeficit"]), "noncontrolling": fact_series(bundle, ["MinorityInterest"]),
+        "depreciation": fact_series(bundle, ["DepreciationDepletionAndAmortization"]), "equity_comp": fact_series(bundle, ["ShareBasedCompensation"]), "deferred_taxes": fact_series(bundle, ["DeferredIncomeTaxExpenseBenefit"]), "change_receivables": fact_series(bundle, ["IncreaseDecreaseInAccountsReceivable"]), "change_inventory": fact_series(bundle, ["IncreaseDecreaseInInventories"]), "change_payables": fact_series(bundle, ["IncreaseDecreaseInAccountsPayable"]), "change_other_current": fact_series(bundle, ["IncreaseDecreaseInOtherOperatingAssets"]), "change_other_liabilities": fact_series(bundle, ["IncreaseDecreaseInOtherOperatingLiabilities"]), "proceeds_debt": fact_series(bundle, ["ProceedsFromIssuanceOfLongTermDebt"]), "payments_debt": fact_series(bundle, ["RepaymentsOfLongTermDebt"]), "cash_begin": fact_series(bundle, ["CashAndCashEquivalentsAtCarryingValue"]),
+    })
+    if result["gross"].empty and not result["revenue"].empty and not result["cogs"].empty:
+        result["gross"] = result["revenue"].subtract(result["cogs"], fill_value=np.nan)
+    if result["opex"].empty and (not result["rd"].empty or not result["ga"].empty):
+        result["opex"] = result["rd"].add(result["ga"], fill_value=0)
+    gross = result["gross"]
+    result["revenue_yoy"] = latest_yoy(revenue)
+    result["eps_yoy"] = latest_yoy(eps)
+    result["fcf_yoy"] = latest_yoy(cfo)
+    result["net_margin"] = (float(net.iloc[-1] / revenue.iloc[-1] * 100) if len(net) and len(revenue) and revenue.iloc[-1] else None)
+    result["gross_margin"] = (float(gross.iloc[-1] / revenue.iloc[-1] * 100) if len(gross) and len(revenue) and revenue.iloc[-1] else None)
+    result["operating_margin"] = (float(operating.iloc[-1] / revenue.iloc[-1] * 100) if len(operating) and len(revenue) and revenue.iloc[-1] else None)
+    return result
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def yahoo_financials(symbol: str) -> dict[str, Any]:
+
     """Return Yahoo Finance financial statements using standardized yfinance line items."""
     try:
         ticker = yf.Ticker(symbol)
