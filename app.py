@@ -1104,6 +1104,70 @@ def company_peg_ratio(metrics: dict[str, Any], extra: dict[str, Any]) -> float |
     pe = market_cap / net_income if market_cap and net_income else None
     return pe / growth if pe and growth and growth > 0 and shares else None
 
+def peer_metric_frame_from_metrics(
+    metrics_by_symbol: dict[str, dict[str, Any]],
+    line: str,
+    annual: bool = True,
+) -> pd.DataFrame:
+    key = next(
+        (key for _, label, key in STATEMENT_LINES if label == line),
+        "revenue",
+    )
+
+    rows = {}
+
+    for symbol, metrics in metrics_by_symbol.items():
+        if key == "gross_margin_series":
+            gross = metrics.get("gross")
+            revenue = metrics.get("revenue")
+
+            if isinstance(gross, pd.Series) and isinstance(revenue, pd.Series):
+                series = (
+                    gross.divide(
+                        revenue.reindex(gross.index),
+                        fill_value=np.nan,
+                    )
+                    * 100
+                )
+            else:
+                series = pd.Series(dtype=float)
+
+        elif key == "operating_margin_series":
+            operating = metrics.get("operating")
+            revenue = metrics.get("revenue")
+
+            if isinstance(operating, pd.Series) and isinstance(revenue, pd.Series):
+                series = (
+                    operating.divide(
+                        revenue.reindex(operating.index),
+                        fill_value=np.nan,
+                    )
+                    * 100
+                )
+            else:
+                series = pd.Series(dtype=float)
+
+        else:
+            series = metrics.get(key)
+
+        if isinstance(series, pd.Series) and not series.empty:
+            series = series[~series.index.duplicated(keep="last")]
+            series = series.sort_index()
+
+            rows[symbol] = (
+                series.groupby(series.index.year).last()
+                if annual
+                else series.groupby(series.index.to_period("Q")).last()
+            )
+
+    if not rows:
+        return pd.DataFrame()
+
+    frame = pd.DataFrame(rows).T
+    frame.loc["Industry average"] = frame.mean(axis=0)
+
+    return frame
+
 
 def main() -> None:
     st.title("Equity Signal Lab")
