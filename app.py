@@ -1168,6 +1168,279 @@ def peer_metric_frame_from_metrics(
 
     return frame
 
+def roaring_kitty_comparables(
+    symbol: str,
+    metrics: dict[str, Any],
+    extra: dict[str, Any],
+) -> dict[str, Any]:
+    """Build Roaring Kitty-style insider and deep-value comparison metrics."""
+
+    result = {
+        "Insider purchases (1M)": None,
+        "Insider purchases (6M)": None,
+        "<1 week insider purchase ($k)": None,
+        "1-2 week insider purchase ($k)": None,
+        "2-4 week insider purchase ($k)": None,
+        "3M insider purchase ($k)": None,
+        "12M insider purchase ($k)": None,
+        "Sales / Price": None,
+        "EBITDA / EV": None,
+        "Tangible Book / Price": None,
+        "Book Value / Price": None,
+        "Net Income / Price": None,
+        "Operating Cash Flow / Price": None,
+        "Simple Free Cash Flow / Price": None,
+        "Net Cash Flow / Price": None,
+        "Div / Price": None,
+        "Cash / Price": None,
+        "Net Cash / Price": None,
+    }
+
+    # ---------------------------------------------------------
+    # Insider purchases
+    # ---------------------------------------------------------
+    try:
+        insider = openinsider_table(symbol)
+
+        if insider is None or insider.empty:
+            insider = insider_trades(symbol)
+
+        if insider is not None and not insider.empty:
+            insider = insider.copy()
+
+            # Normalize date column.
+            date_col = next(
+                (
+                    c for c in ["Date", "date", "Transaction Date", "Start Date"]
+                    if c in insider.columns
+                ),
+                None,
+            )
+
+            if date_col:
+                insider["_date"] = pd.to_datetime(
+                    insider[date_col],
+                    errors="coerce",
+                )
+
+                insider = insider.dropna(subset=["_date"])
+
+                # Identify transaction type.
+                text_columns = [
+                    c for c in insider.columns
+                    if insider[c].dtype == "object"
+                ]
+
+                if text_columns:
+                    transaction_text = (
+                        insider[text_columns]
+                        .fillna("")
+                        .astype(str)
+                        .agg(" ".join, axis=1)
+                        .str.lower()
+                    )
+                else:
+                    transaction_text = pd.Series(
+                        "",
+                        index=insider.index,
+                    )
+
+                # Prefer explicit purchase/buy transactions.
+                purchase_mask = (
+                    transaction_text.str.contains(
+                        r"\bbuy\b|\bpurchase\b|\bacquisition\b|\bopen market",
+                        regex=True,
+                        na=False,
+                    )
+                    & ~transaction_text.str.contains(
+                        r"\bsale\b|\bsold\b",
+                        regex=True,
+                        na=False,
+                    )
+                )
+
+                purchases = insider.loc[purchase_mask].copy()
+
+                # Find transaction value.
+                value_col = next(
+                    (
+                        c for c in [
+                            "Value",
+                            "Transaction Value",
+                            "Value ($)",
+                            "Total Value",
+                            "Amount",
+                        ]
+                        if c in purchases.columns
+                    ),
+                    None,
+                )
+
+                if value_col:
+                    purchases["_value"] = pd.to_numeric(
+                        purchases[value_col]
+                        .astype(str)
+                        .str.replace("$", "", regex=False)
+                        .str.replace(",", "", regex=False)
+                        .str.replace("(", "-", regex=False)
+                        .str.replace(")", "", regex=False),
+                        errors="coerce",
+                    )
+                else:
+                    purchases["_value"] = np.nan
+
+                now = pd.Timestamp.now().normalize()
+
+                def window(days: int) -> pd.DataFrame:
+                    return purchases[
+                        (purchases["_date"] >= now - pd.Timedelta(days=days))
+                        & (purchases["_date"] <= now)
+                    ]
+
+                one_month = window(30)
+                six_month = window(180)
+
+                result["Insider purchases (1M)"] = len(one_month)
+                result["Insider purchases (6M)"] = len(six_month)
+
+                result["<1 week insider purchase ($k)"] = (
+                    one_month.loc[
+                        one_month["_date"] >= now - pd.Timedelta(days=7),
+                        "_value",
+                    ].sum() / 1_000
+                    if "_value" in one_month
+                    else None
+                )
+
+                result["1-2 week insider purchase ($k)"] = (
+                    one_month.loc[
+                        (one_month["_date"] < now - pd.Timedelta(days=7))
+                        & (one_month["_date"] >= now - pd.Timedelta(days=14)),
+                        "_value",
+                    ].sum() / 1_000
+                )
+
+                result["2-4 week insider purchase ($k)"] = (
+                    one_month.loc[
+                        (one_month["_date"] < now - pd.Timedelta(days=14))
+                        & (one_month["_date"] >= now - pd.Timedelta(days=28)),
+                        "_value",
+                    ].sum() / 1_000
+                )
+
+                result["3M insider purchase ($k)"] = (
+                    window(90)["_value"].sum() / 1_000
+                )
+
+                result["12M insider purchase ($k)"] = (
+                    window(365)["_value"].sum() / 1_000
+                )
+
+    except Exception:
+        pass
+
+    # ---------------------------------------------------------
+    # Valuation / balance-sheet ratios
+    #
+    # These are expressed as VALUE / PRICE, which is the inverse
+    # of the more familiar price-to-value multiple.
+    # ---------------------------------------------------------
+    price = extra.get("price")
+    market_cap = extra.get("market_cap")
+
+    def latest_value(key: str) -> float | None:
+        value = metrics.get(key)
+
+        if isinstance(value, pd.Series):
+            value = value.dropna()
+            return float(value.iloc[-1]) if not value.empty else None
+
+        if value is None:
+            return None
+
+        try:
+            return float(value)
+        except Exception:
+            return None
+
+    def ratio_to_market_cap(value: float | None) -> float | None:
+        if value is None or not market_cap:
+            return None
+        return value / market_cap
+
+    # Revenue / Market Cap = Sales / Price.
+    revenue = latest_value("revenue")
+    result["Sales / Price"] = ratio_to_market_cap(revenue)
+
+    # EBITDA / EV.
+    ebitda = latest_value("ebitda")
+    enterprise_value = extra.get("enterprise_value")
+
+    if enterprise_value is None:
+        debt = extra.get("debt") or 0
+        cash = extra.get("cash") or 0
+        if market_cap:
+            enterprise_value = market_cap + debt - cash
+
+    if ebitda is not None and enterprise_value:
+        result["EBITDA / EV"] = ebitda / enterprise_value
+
+    # Book value / Price.
+    book_value = latest_value("book_value")
+    if book_value is None:
+        book_value = latest_value("book")
+
+    result["Book Value / Price"] = ratio_to_market_cap(book_value)
+
+    # Tangible book value.
+    tangible_book = latest_value("tangible_book")
+    result["Tangible Book / Price"] = ratio_to_market_cap(tangible_book)
+
+    # Net income / Price.
+    net_income = latest_value("net_income")
+    result["Net Income / Price"] = ratio_to_market_cap(net_income)
+
+    # Operating cash flow / Price.
+    operating_cash_flow = latest_value("cfo")
+    result["Operating Cash Flow / Price"] = ratio_to_market_cap(
+        operating_cash_flow
+    )
+
+    # Simple FCF / Price.
+    capex = latest_value("capex")
+    if operating_cash_flow is not None and capex is not None:
+        simple_fcf = operating_cash_flow - abs(capex)
+        result["Simple Free Cash Flow / Price"] = ratio_to_market_cap(
+            simple_fcf
+        )
+
+    # Net cash flow / Price.
+    net_cash_flow = latest_value("net_cash_flow")
+    result["Net Cash Flow / Price"] = ratio_to_market_cap(net_cash_flow)
+
+    # Dividends / Price.
+    dividends = latest_value("dividends")
+    result["Div / Price"] = ratio_to_market_cap(dividends)
+
+    # Cash / Price.
+    cash = extra.get("cash")
+    if cash is None:
+        cash = latest_value("cash")
+
+    result["Cash / Price"] = ratio_to_market_cap(cash)
+
+    # Net cash / Price.
+    debt = extra.get("debt")
+    if debt is None:
+        debt = latest_value("debt")
+
+    if cash is not None:
+        net_cash = cash - (debt or 0)
+        result["Net Cash / Price"] = ratio_to_market_cap(net_cash)
+
+    return result
+
+
 
 def main() -> None:
     st.title("Equity Signal Lab")
@@ -1425,40 +1698,37 @@ def main() -> None:
                 available_lines,
                 key="financial_line",
             )
-
+        
             comparison_metrics = {
                 symbol: financial_metrics,
                 **peer_financial_metrics,
             }
-
+        
             comparison = peer_metric_frame_from_metrics(
                 comparison_metrics,
                 selected_line,
                 annual=annual_view,
             )
-
+        
             if not comparison.empty:
                 latest_column = comparison.columns[-1]
-
                 chart_values = (
                     comparison[latest_column]
                     .rename("Latest reported value")
                     .to_frame()
                 )
-
+        
                 st.markdown(
                     f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**"
                 )
-
+        
                 colors = [
-                    "#2563eb"
-                    if name == symbol
-                    else "#4b5563"
-                    if name == "Industry average"
+                    "#2563eb" if name == symbol
+                    else "#4b5563" if name == "Industry average"
                     else "#d1d5db"
                     for name in chart_values.index
                 ]
-
+        
                 peer_fig = go.Figure(
                     go.Bar(
                         x=chart_values.index,
@@ -1467,25 +1737,73 @@ def main() -> None:
                         hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>",
                     )
                 )
-
+        
                 peer_fig.update_layout(
                     height=330,
                     template="plotly_white",
-                    margin={
-                        "l": 20,
-                        "r": 20,
-                        "t": 20,
-                        "b": 60,
-                    },
+                    margin={"l": 20, "r": 20, "t": 20, "b": 60},
                 )
+        
+                st.plotly_chart(peer_fig, use_container_width=True)
 
-                st.plotly_chart(
-                    peer_fig,
-                    use_container_width=True,
-                )
 
+        # ---------------------------------------------------------
+        # Roaring Kitty Comparables
+        # ---------------------------------------------------------
+        st.markdown("**Roaring Kitty Comparables**")
+        
+        rk_comps = roaring_kitty_comparables(
+            symbol,
+            metrics,
+            extra,
+        )
+        
+        rk_display = pd.DataFrame(
+            [
+                {
+                    "Metric": metric,
+                    symbol: value,
+                }
+                for metric, value in rk_comps.items()
+            ]
+        )
+        
+        def format_rk_value(row):
+            metric = row["Metric"]
+            value = row[symbol]
+        
+            if pd.isna(value) or value is None:
+                return "NA"
+        
+            if "purchase" in metric.lower() and "$k" in metric:
+                return f"${value:,.1f}k"
+        
+            if "purchases" in metric.lower():
+                return f"{int(value):,}"
+        
+            # Value / price metrics are yields.
+            return f"{value:.2%}"
+        
+        
+        rk_display[symbol] = rk_display.apply(
+            format_rk_value,
+            axis=1,
+        )
+        
+        st.dataframe(
+            rk_display,
+            use_container_width=True,
+            hide_index=True,
+        )
+        
+        st.caption(
+            "Roaring Kitty-style deep-value and insider-buying metrics. "
+            "Purchase windows are based on detected open-market insider purchases; "
+            "value/price metrics are expressed as the underlying financial value "
+            "divided by market capitalization."
+        )
+        
         st.markdown("**Comparable valuation multiples**")
-
         st.dataframe(
             style_valuation_table(
                 valuation_frame([symbol] + peers),
