@@ -1432,74 +1432,95 @@ comparison = peer_metric_frame_from_metrics(
     annual=annual_view,
 )
 
-            if not comparison.empty:
-                latest_column = comparison.columns[-1]
-                chart_values = comparison[latest_column].rename("Latest reported value").to_frame()
-                st.markdown(f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**")
-                colors = ["#2563eb" if name == symbol else "#d1d5db" if name != "Industry average" else "#4b5563" for name in chart_values.index]
-                peer_fig = go.Figure(go.Bar(x=chart_values.index, y=chart_values.iloc[:, 0], marker_color=colors, hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>"))
-                peer_fig.update_layout(height=330, template="plotly_white", margin={"l": 20, "r": 20, "t": 20, "b": 60})
-                st.plotly_chart(peer_fig, use_container_width=True)
-        st.markdown("**Comparable valuation multiples**")
-        st.dataframe(style_valuation_table(valuation_frame([symbol] + peers), symbol), use_container_width=True, hide_index=True)
-        st.markdown("**DCF workspace**")
-        analyst_growth = pct(extra.get("analyst_growth")) or 12.0
-        consensus_target = extra.get("target")
-        assumptions = st.columns(5)
-        revenue_growth = assumptions[0].number_input("Revenue growth %", value=float(analyst_growth), key="dcf_growth")
-        margin = assumptions[1].number_input("Operating margin %", value=float(metrics.get("operating_margin") or 20), key="dcf_margin")
-        wacc = assumptions[2].number_input("WACC %", value=9.0, key="dcf_wacc")
-        terminal = assumptions[3].number_input("Terminal growth %", value=3.0, key="dcf_terminal")
-        shares = assumptions[4].number_input("Shares (mm)", value=float(metrics.get("shares").iloc[-1] / 1_000_000) if isinstance(metrics.get("shares"), pd.Series) and not metrics["shares"].empty else 1.0, key="dcf_shares")
-        st.caption(f"Analyst consensus growth used to prefill: {analyst_growth:.1f}%. Company guidance: {extra.get('guidance') or 'Not available from the current source.'}")
-        base = ttm(metrics.get("revenue")); base_cogs = ttm(metrics.get("cogs")); base_rd = ttm(metrics.get("rd")); base_ga = ttm(metrics.get("ga")); base_interest = ttm(metrics.get("interest")); base_cfo = ttm(metrics.get("cfo")); base_capex = ttm(metrics.get("capex")); years = np.arange(0, 6)
-        forecast = pd.DataFrame({"Year": ["Y0 Actuals"] + [f"Y{i}" for i in range(1, 6)]})
-        forecast["Revenue"] = [base * (1 + revenue_growth / 100) ** i for i in years]
-        forecast["COGS"] = forecast.Revenue * (base_cogs / base if base else (1 - (metrics.get("gross_margin") or 50) / 100))
-        forecast["Gross Profit"] = forecast.Revenue - forecast.COGS
-        forecast["R&D"] = forecast.Revenue * (base_rd / base if base and base_rd else .08); forecast["G&A"] = forecast.Revenue * (base_ga / base if base and base_ga else .10)
-        forecast["Total Operating Expenses"] = forecast["R&D"] + forecast["G&A"]
-        forecast["Operating Income"] = forecast.Revenue * margin / 100
-        forecast["Interest Income"] = forecast.Revenue * (base_interest / base if base and base_interest else .005); forecast["Pretax Income"] = forecast["Operating Income"] + forecast["Interest Income"]
-        forecast["Taxes"] = forecast["Pretax Income"] * .21; forecast["Net Income"] = forecast["Pretax Income"] - forecast["Taxes"]
-        forecast["EPS"] = forecast["Net Income"] / max(shares, 1e-9) / 1_000_000
-        forecast["Free Cash Flow"] = [base_cfo - base_capex] + [max(float(forecast.loc[i, "Net Income"]), 0) for i in range(1, 6)]
-        amount_columns = [column for column in forecast.columns if column not in {"Year", "EPS"}]
-        forecast_display = forecast.copy(); forecast_display[amount_columns] = forecast_display[amount_columns] / 1_000_000
-        forecast_table = forecast_display.set_index("Year").T
-        st.dataframe(forecast_table.style.format({column: "{:,.1f}" for column in forecast_table.columns if column != "EPS"} | ({"EPS": "{:,.2f}"} if "EPS" in forecast_table.index else {})), use_container_width=True)
-        fcf_forecast = forecast.loc[1:, "Free Cash Flow"].to_numpy(dtype=float); discount_rate = max(wacc / 100, terminal / 100 + .01); terminal_value = fcf_forecast[-1] * (1 + terminal / 100) / (discount_rate - terminal / 100) if fcf_forecast.size else 0
-        pv_equity = float((fcf_forecast / (1 + discount_rate) ** np.arange(1, 6)).sum() + terminal_value / (1 + discount_rate) ** 5 + (extra.get("cash") or 0) - (extra.get("debt") or 0)) if base and shares else 0
-        dcf_price = pv_equity / (shares * 1_000_000) if shares else None
-        dcf_upside = dcf_price / current_price - 1 if dcf_price and current_price else None
-        consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
-        st.caption(f"Editable DCF output: {fmt(dcf_price)} per share. The headline DCF and analyst consensus metrics remain at the top of this tab.")
-        st.markdown("**Insider transactions**")
-        openinsider = openinsider_table(symbol)
-        if not openinsider.empty:
-            st.caption("Source: OpenInsider")
-            st.dataframe(style_insider_table(openinsider, extra.get("market_cap")), use_container_width=True, hide_index=True)
-        else:
-            insider_table = insider_trades(symbol)
-            st.caption("OpenInsider was unavailable; using the available Yahoo Finance insider feed.")
-            st.dataframe(style_insider_table(insider_table.sort_values("Date", ascending=False), extra.get("market_cap")), use_container_width=True, hide_index=True)
-        st.markdown("**Earnings and analyst actions**")
-        earnings_table = earnings_history(symbol)
-        if not earnings_table.empty:
-            keep = [column for column in ["Date", "Reported EPS", "EPS Estimate", "Surprise(%)"] if column in earnings_table.columns]
-            st.dataframe(earnings_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-        actions_table = normalize_actions(analyst_actions(symbol))
-        if not actions_table.empty:
-            keep = [column for column in ["Date", "Firm", "Action", "To Grade", "From Grade", "Price target change"] if column in actions_table.columns]
-            st.caption("Analyst actions are sourced from the available Yahoo Finance feed; MarketWatch estimate and analyst tables are shown below when available.")
-            st.dataframe(actions_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-        marketwatch = marketwatch_tables(symbol)
-        if marketwatch:
-            st.markdown("**MarketWatch EPS estimate trends and analyst tables**")
-            for index, table in enumerate(marketwatch):
-                text = " ".join(str(column) for column in table.columns).lower()
-                if any(token in text for token in ["estimate", "analyst", "consensus", "surprise"]):
-                    st.dataframe(table, use_container_width=True, hide_index=True)
+if not comparison.empty:
+    latest_column = comparison.columns[-1]
+    chart_values = comparison[latest_column].rename("Latest reported value").to_frame()
+    st.markdown(f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**")
+
+    colors = [
+        "#2563eb" if name == symbol
+        else "#4b5563" if name == "Industry average"
+        else "#d1d5db"
+        for name in chart_values.index
+    ]
+
+    peer_fig = go.Figure(
+        go.Bar(
+            x=chart_values.index,
+            y=chart_values.iloc[:, 0],
+            marker_color=colors,
+            hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>",
+        )
+    )
+
+    peer_fig.update_layout(
+        height=330,
+        template="plotly_white",
+        margin={"l": 20, "r": 20, "t": 20, "b": 60},
+    )
+
+    st.plotly_chart(peer_fig, use_container_width=True)
+
+    st.markdown("**Comparable valuation multiples**")
+    st.dataframe(style_valuation_table(valuation_frame([symbol] + peers), symbol), use_container_width=True, hide_index=True)
+    st.markdown("**DCF workspace**")
+    analyst_growth = pct(extra.get("analyst_growth")) or 12.0
+    consensus_target = extra.get("target")
+    assumptions = st.columns(5)
+    revenue_growth = assumptions[0].number_input("Revenue growth %", value=float(analyst_growth), key="dcf_growth")
+    margin = assumptions[1].number_input("Operating margin %", value=float(metrics.get("operating_margin") or 20), key="dcf_margin")
+    wacc = assumptions[2].number_input("WACC %", value=9.0, key="dcf_wacc")
+    terminal = assumptions[3].number_input("Terminal growth %", value=3.0, key="dcf_terminal")
+    shares = assumptions[4].number_input("Shares (mm)", value=float(metrics.get("shares").iloc[-1] / 1_000_000) if isinstance(metrics.get("shares"), pd.Series) and not metrics["shares"].empty else 1.0, key="dcf_shares")
+    st.caption(f"Analyst consensus growth used to prefill: {analyst_growth:.1f}%. Company guidance: {extra.get('guidance') or 'Not available from the current source.'}")
+    base = ttm(metrics.get("revenue")); base_cogs = ttm(metrics.get("cogs")); base_rd = ttm(metrics.get("rd")); base_ga = ttm(metrics.get("ga")); base_interest = ttm(metrics.get("interest")); base_cfo = ttm(metrics.get("cfo")); base_capex = ttm(metrics.get("capex")); years = np.arange(0, 6)
+    forecast = pd.DataFrame({"Year": ["Y0 Actuals"] + [f"Y{i}" for i in range(1, 6)]})
+    forecast["Revenue"] = [base * (1 + revenue_growth / 100) ** i for i in years]
+    forecast["COGS"] = forecast.Revenue * (base_cogs / base if base else (1 - (metrics.get("gross_margin") or 50) / 100))
+    forecast["Gross Profit"] = forecast.Revenue - forecast.COGS
+    forecast["R&D"] = forecast.Revenue * (base_rd / base if base and base_rd else .08); forecast["G&A"] = forecast.Revenue * (base_ga / base if base and base_ga else .10)
+    forecast["Total Operating Expenses"] = forecast["R&D"] + forecast["G&A"]
+    forecast["Operating Income"] = forecast.Revenue * margin / 100
+    forecast["Interest Income"] = forecast.Revenue * (base_interest / base if base and base_interest else .005); forecast["Pretax Income"] = forecast["Operating Income"] + forecast["Interest Income"]
+    forecast["Taxes"] = forecast["Pretax Income"] * .21; forecast["Net Income"] = forecast["Pretax Income"] - forecast["Taxes"]
+    forecast["EPS"] = forecast["Net Income"] / max(shares, 1e-9) / 1_000_000
+    forecast["Free Cash Flow"] = [base_cfo - base_capex] + [max(float(forecast.loc[i, "Net Income"]), 0) for i in range(1, 6)]
+    amount_columns = [column for column in forecast.columns if column not in {"Year", "EPS"}]
+    forecast_display = forecast.copy(); forecast_display[amount_columns] = forecast_display[amount_columns] / 1_000_000
+    forecast_table = forecast_display.set_index("Year").T
+    st.dataframe(forecast_table.style.format({column: "{:,.1f}" for column in forecast_table.columns if column != "EPS"} | ({"EPS": "{:,.2f}"} if "EPS" in forecast_table.index else {})), use_container_width=True)
+    fcf_forecast = forecast.loc[1:, "Free Cash Flow"].to_numpy(dtype=float); discount_rate = max(wacc / 100, terminal / 100 + .01); terminal_value = fcf_forecast[-1] * (1 + terminal / 100) / (discount_rate - terminal / 100) if fcf_forecast.size else 0
+    pv_equity = float((fcf_forecast / (1 + discount_rate) ** np.arange(1, 6)).sum() + terminal_value / (1 + discount_rate) ** 5 + (extra.get("cash") or 0) - (extra.get("debt") or 0)) if base and shares else 0
+    dcf_price = pv_equity / (shares * 1_000_000) if shares else None
+    dcf_upside = dcf_price / current_price - 1 if dcf_price and current_price else None
+    consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
+    st.caption(f"Editable DCF output: {fmt(dcf_price)} per share. The headline DCF and analyst consensus metrics remain at the top of this tab.")
+    st.markdown("**Insider transactions**")
+    openinsider = openinsider_table(symbol)
+    if not openinsider.empty:
+        st.caption("Source: OpenInsider")
+        st.dataframe(style_insider_table(openinsider, extra.get("market_cap")), use_container_width=True, hide_index=True)
+    else:
+        insider_table = insider_trades(symbol)
+        st.caption("OpenInsider was unavailable; using the available Yahoo Finance insider feed.")
+        st.dataframe(style_insider_table(insider_table.sort_values("Date", ascending=False), extra.get("market_cap")), use_container_width=True, hide_index=True)
+    st.markdown("**Earnings and analyst actions**")
+    earnings_table = earnings_history(symbol)
+    if not earnings_table.empty:
+        keep = [column for column in ["Date", "Reported EPS", "EPS Estimate", "Surprise(%)"] if column in earnings_table.columns]
+        st.dataframe(earnings_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
+    actions_table = normalize_actions(analyst_actions(symbol))
+    if not actions_table.empty:
+        keep = [column for column in ["Date", "Firm", "Action", "To Grade", "From Grade", "Price target change"] if column in actions_table.columns]
+        st.caption("Analyst actions are sourced from the available Yahoo Finance feed; MarketWatch estimate and analyst tables are shown below when available.")
+        st.dataframe(actions_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
+    marketwatch = marketwatch_tables(symbol)
+    if marketwatch:
+        st.markdown("**MarketWatch EPS estimate trends and analyst tables**")
+        for index, table in enumerate(marketwatch):
+            text = " ".join(str(column) for column in table.columns).lower()
+            if any(token in text for token in ["estimate", "analyst", "consensus", "surprise"]):
+                st.dataframe(table, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
