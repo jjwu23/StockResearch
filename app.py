@@ -1227,300 +1227,547 @@ def main() -> None:
         if not chart_frame.empty:
             st.plotly_chart(chart(symbol, chart_frame, direction, row.get("Insider 90d $")), use_container_width=True)
         st.caption("EMA colors: 20-day deeper orange, 200-day gold, 200-week thick gold. Green/red circles mark earnings surprises; green/red circles along the bottom border mark analyst upgrades/downgrades.")
-st.markdown("**Reported financials**")
+        st.markdown("**Reported financials**")
 
-financial_source = st.radio(
-    "Financial data source",
-    ["SEC XBRL", "Yahoo Finance"],
-    horizontal=True,
-    key="financial_source",
-    help=(
-        "SEC XBRL uses reported filing facts and can have issuer-specific "
-        "taxonomy differences. Yahoo Finance normalizes statement line items "
-        "across companies, which can make peer comparison easier."
-    ),
-)
-
-annual_view = (
-    st.radio(
-        "Reporting period",
-        ["Annual", "Quarterly"],
-        horizontal=True,
-        key="reporting_period",
-    )
-    == "Annual"
-)
-
-if financial_source == "SEC XBRL":
-    financial_metrics = metrics
-    peer_financial_metrics = {
-        peer: filing_metrics(peer)
-        for peer in peers
-    }
-    financial_source_label = "SEC XBRL"
-else:
-    financial_metrics = yahoo_statement_metrics(symbol)
-    peer_financial_metrics = {
-        peer: yahoo_statement_metrics(peer)
-        for peer in peers
-    }
-    financial_source_label = "Yahoo Finance"
-
-company_table = statement_frame(
-    financial_metrics,
-    annual=annual_view,
-)
-
-peer_tables = [
-    statement_frame(
-        peer_financial_metrics[peer],
-        annual=annual_view,
-    )
-    for peer in peers
-]
-
-st.caption(
-    f"Source: {financial_source_label}. "
-    + (
-        "Values are derived from SEC Company Facts and retain issuer filing taxonomy."
-        if financial_source == "SEC XBRL"
-        else "Yahoo Finance provides normalized financial-statement line items."
-    )
-)
-
-st.markdown(
-    f"**Financials — {symbol} ({financial_source_label})**"
-)
-st.dataframe(
-    style_financial_table(company_table, peer_tables),
-    use_container_width=True,
-)
-
-peer_label = st.selectbox(
-    "Comparison table",
-    ["Industry average"] + [f"Peer {i + 1} · {p}" for i, p in enumerate(peers)],
-    key="peer_table",
-)
-
-if peer_label == "Industry average":
-    aligned = [p for p in peer_tables if not p.empty]
-    comparison_table = (
-        pd.concat(aligned)
-        .groupby(level=0)
-        .mean()
-        .reindex(index=company_table.index, columns=company_table.columns)
-        if aligned
-        else pd.DataFrame(
-            index=company_table.index,
-            columns=company_table.columns,
+        financial_source = st.radio(
+            "Financial data source",
+            ["SEC XBRL", "Yahoo Finance"],
+            horizontal=True,
+            key="financial_source",
+            help=(
+                "SEC XBRL uses reported filing facts and can have issuer-specific "
+                "taxonomy differences. Yahoo Finance normalizes statement line items "
+                "across companies, which can make peer comparison easier."
+            ),
         )
-    )
-else:
-    peer_symbol = peers[int(peer_label.split("·")[0].split()[-1]) - 1]
-    comparison_table = statement_frame(
-        peer_financial_metrics.get(
-            peer_symbol,
-            yahoo_statement_metrics(peer_symbol)
-            if financial_source == "Yahoo Finance"
-            else filing_metrics(peer_symbol),
-        ),
-        annual=annual_view,
-    )
 
-st.markdown(
-    f"**Financials — {peer_label} ({financial_source_label})**"
-)
-st.dataframe(
-    style_financial_table(comparison_table),
-    use_container_width=True,
-)
+        annual_view = (
+            st.radio(
+                "Reporting period",
+                ["Annual", "Quarterly"],
+                horizontal=True,
+                key="reporting_period",
+            )
+            == "Annual"
+        )
 
-available_lines = [
-    label
-    for _, label, _ in STATEMENT_LINES
-    if any(
-        str(index).endswith(f"· {label} ($mm)")
-        or str(index).endswith(f"· {label}")
-        for index in company_table.index
-    )
-]
-
-if available_lines:
-    selected_line = st.selectbox(
-        "Financial line for peer chart",
-        available_lines,
-        key="financial_line",
-    )
-
-
-def peer_metric_frame_from_metrics(
-    metrics_by_symbol: dict[str, dict[str, Any]],
-    line: str,
-    annual: bool = True,
-) -> pd.DataFrame:
-    key = next(
-        (key for _, label, key in STATEMENT_LINES if label == line),
-        "revenue",
-    )
-
-    rows = {}
-
-    for symbol, metrics in metrics_by_symbol.items():
-        if key == "gross_margin_series":
-            gross = metrics.get("gross")
-            revenue = metrics.get("revenue")
-
-            if isinstance(gross, pd.Series) and isinstance(revenue, pd.Series):
-                series = (
-                    gross
-                    .divide(
-                        revenue.reindex(gross.index),
-                        fill_value=np.nan,
-                    )
-                    * 100
-                )
-            else:
-                series = pd.Series(dtype=float)
-
-        elif key == "operating_margin_series":
-            operating = metrics.get("operating")
-            revenue = metrics.get("revenue")
-
-            if isinstance(operating, pd.Series) and isinstance(revenue, pd.Series):
-                series = (
-                    operating
-                    .divide(
-                        revenue.reindex(operating.index),
-                        fill_value=np.nan,
-                    )
-                    * 100
-                )
-            else:
-                series = pd.Series(dtype=float)
-
+        if financial_source == "SEC XBRL":
+            financial_metrics = metrics
+            peer_financial_metrics = {
+                peer: filing_metrics(peer)
+                for peer in peers
+            }
+            financial_source_label = "SEC XBRL"
         else:
-            series = metrics.get(key)
+            financial_metrics = yahoo_statement_metrics(symbol)
+            peer_financial_metrics = {
+                peer: yahoo_statement_metrics(peer)
+                for peer in peers
+            }
+            financial_source_label = "Yahoo Finance"
 
-        if isinstance(series, pd.Series) and not series.empty:
-            series = series[~series.index.duplicated(keep="last")]
-            series = series.sort_index()
+        company_table = statement_frame(
+            financial_metrics,
+            annual=annual_view,
+        )
 
-            rows[symbol] = (
-                series.groupby(series.index.year).last()
-                if annual
-                else series.groupby(series.index.to_period("Q")).last()
+        peer_tables = [
+            statement_frame(
+                peer_financial_metrics[peer],
+                annual=annual_view,
+            )
+            for peer in peers
+        ]
+
+        st.caption(
+            f"Source: {financial_source_label}. "
+            + (
+                "Values are derived from SEC Company Facts and retain issuer filing taxonomy."
+                if financial_source == "SEC XBRL"
+                else "Yahoo Finance provides normalized financial-statement line items."
+            )
+        )
+
+        st.markdown(
+            f"**Financials — {symbol} ({financial_source_label})**"
+        )
+        st.dataframe(
+            style_financial_table(company_table, peer_tables),
+            use_container_width=True,
+        )
+
+        peer_label = st.selectbox(
+            "Comparison table",
+            ["Industry average"] + [
+                f"Peer {i + 1} · {p}"
+                for i, p in enumerate(peers)
+            ],
+            key="peer_table",
+        )
+
+        if peer_label == "Industry average":
+            aligned = [p for p in peer_tables if not p.empty]
+            comparison_table = (
+                pd.concat(aligned)
+                .groupby(level=0)
+                .mean()
+                .reindex(
+                    index=company_table.index,
+                    columns=company_table.columns,
+                )
+                if aligned
+                else pd.DataFrame(
+                    index=company_table.index,
+                    columns=company_table.columns,
+                )
+            )
+        else:
+            peer_symbol = peers[
+                int(peer_label.split("·")[0].split()[-1]) - 1
+            ]
+
+            comparison_table = statement_frame(
+                peer_financial_metrics.get(
+                    peer_symbol,
+                    yahoo_statement_metrics(peer_symbol)
+                    if financial_source == "Yahoo Finance"
+                    else filing_metrics(peer_symbol),
+                ),
+                annual=annual_view,
             )
 
-    if not rows:
-        return pd.DataFrame()
-
-    frame = pd.DataFrame(rows).T
-    frame.loc["Industry average"] = frame.mean(axis=0)
-
-    return frame
-
-
-comparison_metrics = {
-    symbol: financial_metrics,
-    **peer_financial_metrics,
-}
-
-
-comparison = peer_metric_frame_from_metrics(
-    comparison_metrics,
-    selected_line,
-    annual=annual_view,
-)
-
-if not comparison.empty:
-    latest_column = comparison.columns[-1]
-    chart_values = comparison[latest_column].rename("Latest reported value").to_frame()
-    st.markdown(f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**")
-
-    colors = [
-        "#2563eb" if name == symbol
-        else "#4b5563" if name == "Industry average"
-        else "#d1d5db"
-        for name in chart_values.index
-    ]
-
-    peer_fig = go.Figure(
-        go.Bar(
-            x=chart_values.index,
-            y=chart_values.iloc[:, 0],
-            marker_color=colors,
-            hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>",
+        st.markdown(
+            f"**Financials — {peer_label} ({financial_source_label})**"
         )
-    )
 
-    peer_fig.update_layout(
-        height=330,
-        template="plotly_white",
-        margin={"l": 20, "r": 20, "t": 20, "b": 60},
-    )
+        st.dataframe(
+            style_financial_table(comparison_table),
+            use_container_width=True,
+        )
 
-    st.plotly_chart(peer_fig, use_container_width=True)
+        available_lines = [
+            label
+            for _, label, _ in STATEMENT_LINES
+            if any(
+                str(index).endswith(f"· {label} ($mm)")
+                or str(index).endswith(f"· {label}")
+                for index in company_table.index
+            )
+        ]
 
-    st.markdown("**Comparable valuation multiples**")
-    st.dataframe(style_valuation_table(valuation_frame([symbol] + peers), symbol), use_container_width=True, hide_index=True)
-    st.markdown("**DCF workspace**")
-    analyst_growth = pct(extra.get("analyst_growth")) or 12.0
-    consensus_target = extra.get("target")
-    assumptions = st.columns(5)
-    revenue_growth = assumptions[0].number_input("Revenue growth %", value=float(analyst_growth), key="dcf_growth")
-    margin = assumptions[1].number_input("Operating margin %", value=float(metrics.get("operating_margin") or 20), key="dcf_margin")
-    wacc = assumptions[2].number_input("WACC %", value=9.0, key="dcf_wacc")
-    terminal = assumptions[3].number_input("Terminal growth %", value=3.0, key="dcf_terminal")
-    shares = assumptions[4].number_input("Shares (mm)", value=float(metrics.get("shares").iloc[-1] / 1_000_000) if isinstance(metrics.get("shares"), pd.Series) and not metrics["shares"].empty else 1.0, key="dcf_shares")
-    st.caption(f"Analyst consensus growth used to prefill: {analyst_growth:.1f}%. Company guidance: {extra.get('guidance') or 'Not available from the current source.'}")
-    base = ttm(metrics.get("revenue")); base_cogs = ttm(metrics.get("cogs")); base_rd = ttm(metrics.get("rd")); base_ga = ttm(metrics.get("ga")); base_interest = ttm(metrics.get("interest")); base_cfo = ttm(metrics.get("cfo")); base_capex = ttm(metrics.get("capex")); years = np.arange(0, 6)
-    forecast = pd.DataFrame({"Year": ["Y0 Actuals"] + [f"Y{i}" for i in range(1, 6)]})
-    forecast["Revenue"] = [base * (1 + revenue_growth / 100) ** i for i in years]
-    forecast["COGS"] = forecast.Revenue * (base_cogs / base if base else (1 - (metrics.get("gross_margin") or 50) / 100))
-    forecast["Gross Profit"] = forecast.Revenue - forecast.COGS
-    forecast["R&D"] = forecast.Revenue * (base_rd / base if base and base_rd else .08); forecast["G&A"] = forecast.Revenue * (base_ga / base if base and base_ga else .10)
-    forecast["Total Operating Expenses"] = forecast["R&D"] + forecast["G&A"]
-    forecast["Operating Income"] = forecast.Revenue * margin / 100
-    forecast["Interest Income"] = forecast.Revenue * (base_interest / base if base and base_interest else .005); forecast["Pretax Income"] = forecast["Operating Income"] + forecast["Interest Income"]
-    forecast["Taxes"] = forecast["Pretax Income"] * .21; forecast["Net Income"] = forecast["Pretax Income"] - forecast["Taxes"]
-    forecast["EPS"] = forecast["Net Income"] / max(shares, 1e-9) / 1_000_000
-    forecast["Free Cash Flow"] = [base_cfo - base_capex] + [max(float(forecast.loc[i, "Net Income"]), 0) for i in range(1, 6)]
-    amount_columns = [column for column in forecast.columns if column not in {"Year", "EPS"}]
-    forecast_display = forecast.copy(); forecast_display[amount_columns] = forecast_display[amount_columns] / 1_000_000
-    forecast_table = forecast_display.set_index("Year").T
-    st.dataframe(forecast_table.style.format({column: "{:,.1f}" for column in forecast_table.columns if column != "EPS"} | ({"EPS": "{:,.2f}"} if "EPS" in forecast_table.index else {})), use_container_width=True)
-    fcf_forecast = forecast.loc[1:, "Free Cash Flow"].to_numpy(dtype=float); discount_rate = max(wacc / 100, terminal / 100 + .01); terminal_value = fcf_forecast[-1] * (1 + terminal / 100) / (discount_rate - terminal / 100) if fcf_forecast.size else 0
-    pv_equity = float((fcf_forecast / (1 + discount_rate) ** np.arange(1, 6)).sum() + terminal_value / (1 + discount_rate) ** 5 + (extra.get("cash") or 0) - (extra.get("debt") or 0)) if base and shares else 0
-    dcf_price = pv_equity / (shares * 1_000_000) if shares else None
-    dcf_upside = dcf_price / current_price - 1 if dcf_price and current_price else None
-    consensus_upside = consensus_target / current_price - 1 if consensus_target and current_price else None
-    st.caption(f"Editable DCF output: {fmt(dcf_price)} per share. The headline DCF and analyst consensus metrics remain at the top of this tab.")
-    st.markdown("**Insider transactions**")
-    openinsider = openinsider_table(symbol)
-    if not openinsider.empty:
-        st.caption("Source: OpenInsider")
-        st.dataframe(style_insider_table(openinsider, extra.get("market_cap")), use_container_width=True, hide_index=True)
-    else:
-        insider_table = insider_trades(symbol)
-        st.caption("OpenInsider was unavailable; using the available Yahoo Finance insider feed.")
-        st.dataframe(style_insider_table(insider_table.sort_values("Date", ascending=False), extra.get("market_cap")), use_container_width=True, hide_index=True)
-    st.markdown("**Earnings and analyst actions**")
-    earnings_table = earnings_history(symbol)
-    if not earnings_table.empty:
-        keep = [column for column in ["Date", "Reported EPS", "EPS Estimate", "Surprise(%)"] if column in earnings_table.columns]
-        st.dataframe(earnings_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-    actions_table = normalize_actions(analyst_actions(symbol))
-    if not actions_table.empty:
-        keep = [column for column in ["Date", "Firm", "Action", "To Grade", "From Grade", "Price target change"] if column in actions_table.columns]
-        st.caption("Analyst actions are sourced from the available Yahoo Finance feed; MarketWatch estimate and analyst tables are shown below when available.")
-        st.dataframe(actions_table[keep].sort_values("Date", ascending=False), use_container_width=True, hide_index=True)
-    marketwatch = marketwatch_tables(symbol)
-    if marketwatch:
-        st.markdown("**MarketWatch EPS estimate trends and analyst tables**")
-        for index, table in enumerate(marketwatch):
-            text = " ".join(str(column) for column in table.columns).lower()
-            if any(token in text for token in ["estimate", "analyst", "consensus", "surprise"]):
-                st.dataframe(table, use_container_width=True, hide_index=True)
+        if available_lines:
+            selected_line = st.selectbox(
+                "Financial line for peer chart",
+                available_lines,
+                key="financial_line",
+            )
+
+            comparison_metrics = {
+                symbol: financial_metrics,
+                **peer_financial_metrics,
+            }
+
+            comparison = peer_metric_frame_from_metrics(
+                comparison_metrics,
+                selected_line,
+                annual=annual_view,
+            )
+
+            if not comparison.empty:
+                latest_column = comparison.columns[-1]
+
+                chart_values = (
+                    comparison[latest_column]
+                    .rename("Latest reported value")
+                    .to_frame()
+                )
+
+                st.markdown(
+                    f"**{selected_line}: selected stock vs Peer 1/2/3 and industry average**"
+                )
+
+                colors = [
+                    "#2563eb"
+                    if name == symbol
+                    else "#4b5563"
+                    if name == "Industry average"
+                    else "#d1d5db"
+                    for name in chart_values.index
+                ]
+
+                peer_fig = go.Figure(
+                    go.Bar(
+                        x=chart_values.index,
+                        y=chart_values.iloc[:, 0],
+                        marker_color=colors,
+                        hovertemplate="%{x}<br>%{y:,.1f}<extra></extra>",
+                    )
+                )
+
+                peer_fig.update_layout(
+                    height=330,
+                    template="plotly_white",
+                    margin={
+                        "l": 20,
+                        "r": 20,
+                        "t": 20,
+                        "b": 60,
+                    },
+                )
+
+                st.plotly_chart(
+                    peer_fig,
+                    use_container_width=True,
+                )
+
+        st.markdown("**Comparable valuation multiples**")
+
+        st.dataframe(
+            style_valuation_table(
+                valuation_frame([symbol] + peers),
+                symbol,
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.markdown("**DCF workspace**")
+
+        analyst_growth = pct(extra.get("analyst_growth")) or 12.0
+        consensus_target = extra.get("target")
+
+        assumptions = st.columns(5)
+
+        revenue_growth = assumptions[0].number_input(
+            "Revenue growth %",
+            value=float(analyst_growth),
+            key="dcf_growth",
+        )
+
+        margin = assumptions[1].number_input(
+            "Operating margin %",
+            value=float(metrics.get("operating_margin") or 20),
+            key="dcf_margin",
+        )
+
+        wacc = assumptions[2].number_input(
+            "WACC %",
+            value=9.0,
+            key="dcf_wacc",
+        )
+
+        terminal = assumptions[3].number_input(
+            "Terminal growth %",
+            value=3.0,
+            key="dcf_terminal",
+        )
+
+        shares = assumptions[4].number_input(
+            "Shares (mm)",
+            value=(
+                float(metrics.get("shares").iloc[-1] / 1_000_000)
+                if isinstance(metrics.get("shares"), pd.Series)
+                and not metrics["shares"].empty
+                else 1.0
+            ),
+            key="dcf_shares",
+        )
+
+        st.caption(
+            f"Analyst consensus growth used to prefill: "
+            f"{analyst_growth:.1f}%. Company guidance: "
+            f"{extra.get('guidance') or 'Not available from the current source.'}"
+        )
+
+        base = ttm(metrics.get("revenue"))
+        base_cogs = ttm(metrics.get("cogs"))
+        base_rd = ttm(metrics.get("rd"))
+        base_ga = ttm(metrics.get("ga"))
+        base_interest = ttm(metrics.get("interest"))
+        base_cfo = ttm(metrics.get("cfo"))
+        base_capex = ttm(metrics.get("capex"))
+
+        years = np.arange(0, 6)
+
+        forecast = pd.DataFrame(
+            {
+                "Year": ["Y0 Actuals"] + [f"Y{i}" for i in range(1, 6)]
+            }
+        )
+
+        forecast["Revenue"] = [
+            base * (1 + revenue_growth / 100) ** i
+            for i in years
+        ]
+
+        forecast["COGS"] = forecast.Revenue * (
+            base_cogs / base
+            if base
+            else (1 - (metrics.get("gross_margin") or 50) / 100)
+        )
+
+        forecast["Gross Profit"] = (
+            forecast["Revenue"] - forecast["COGS"]
+        )
+
+        forecast["R&D"] = forecast.Revenue * (
+            base_rd / base
+            if base and base_rd
+            else 0.08
+        )
+
+        forecast["G&A"] = forecast.Revenue * (
+            base_ga / base
+            if base and base_ga
+            else 0.10
+        )
+
+        forecast["Total Operating Expenses"] = (
+            forecast["R&D"] + forecast["G&A"]
+        )
+
+        forecast["Operating Income"] = (
+            forecast.Revenue * margin / 100
+        )
+
+        forecast["Interest Income"] = forecast.Revenue * (
+            base_interest / base
+            if base and base_interest
+            else 0.005
+        )
+
+        forecast["Pretax Income"] = (
+            forecast["Operating Income"]
+            + forecast["Interest Income"]
+        )
+
+        forecast["Taxes"] = forecast["Pretax Income"] * 0.21
+
+        forecast["Net Income"] = (
+            forecast["Pretax Income"] - forecast["Taxes"]
+        )
+
+        forecast["EPS"] = (
+            forecast["Net Income"]
+            / max(shares, 1e-9)
+            / 1_000_000
+        )
+
+        forecast["Free Cash Flow"] = (
+            [base_cfo - base_capex]
+            + [
+                max(float(forecast.loc[i, "Net Income"]), 0)
+                for i in range(1, 6)
+            ]
+        )
+
+        amount_columns = [
+            column
+            for column in forecast.columns
+            if column not in {"Year", "EPS"}
+        ]
+
+        forecast_display = forecast.copy()
+
+        forecast_display[amount_columns] = (
+            forecast_display[amount_columns] / 1_000_000
+        )
+
+        forecast_table = forecast_display.set_index("Year").T
+
+        st.dataframe(
+            forecast_table.style.format(
+                {
+                    column: "{:,.1f}"
+                    for column in forecast_table.columns
+                    if column != "EPS"
+                }
+                | (
+                    {"EPS": "{:,.2f}"}
+                    if "EPS" in forecast_table.index
+                    else {}
+                )
+            ),
+            use_container_width=True,
+        )
+
+        fcf_forecast = forecast.loc[
+            1:, "Free Cash Flow"
+        ].to_numpy(dtype=float)
+
+        discount_rate = max(
+            wacc / 100,
+            terminal / 100 + 0.01,
+        )
+
+        terminal_value = (
+            fcf_forecast[-1]
+            * (1 + terminal / 100)
+            / (discount_rate - terminal / 100)
+            if fcf_forecast.size
+            else 0
+        )
+
+        pv_equity = (
+            float(
+                (
+                    fcf_forecast
+                    / (1 + discount_rate)
+                    ** np.arange(1, 6)
+                ).sum()
+                + terminal_value
+                / (1 + discount_rate) ** 5
+                + (extra.get("cash") or 0)
+                - (extra.get("debt") or 0)
+            )
+            if base and shares
+            else 0
+        )
+
+        dcf_price = (
+            pv_equity / (shares * 1_000_000)
+            if shares
+            else None
+        )
+
+        dcf_upside = (
+            dcf_price / current_price - 1
+            if dcf_price and current_price
+            else None
+        )
+
+        consensus_upside = (
+            consensus_target / current_price - 1
+            if consensus_target and current_price
+            else None
+        )
+
+        st.caption(
+            f"Editable DCF output: {fmt(dcf_price)} per share. "
+            "The headline DCF and analyst consensus metrics remain "
+            "at the top of this tab."
+        )
+
+        st.markdown("**Insider transactions**")
+
+        openinsider = openinsider_table(symbol)
+
+        if not openinsider.empty:
+            st.caption("Source: OpenInsider")
+            st.dataframe(
+                style_insider_table(
+                    openinsider,
+                    extra.get("market_cap"),
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            insider_table = insider_trades(symbol)
+
+            st.caption(
+                "OpenInsider was unavailable; using the available "
+                "Yahoo Finance insider feed."
+            )
+
+            st.dataframe(
+                style_insider_table(
+                    insider_table.sort_values(
+                        "Date",
+                        ascending=False,
+                    ),
+                    extra.get("market_cap"),
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        st.markdown("**Earnings and analyst actions**")
+
+        earnings_table = earnings_history(symbol)
+
+        if not earnings_table.empty:
+            keep = [
+                column
+                for column in [
+                    "Date",
+                    "Reported EPS",
+                    "EPS Estimate",
+                    "Surprise(%)",
+                ]
+                if column in earnings_table.columns
+            ]
+
+            st.dataframe(
+                earnings_table[keep].sort_values(
+                    "Date",
+                    ascending=False,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        actions_table = normalize_actions(
+            analyst_actions(symbol)
+        )
+
+        if not actions_table.empty:
+            keep = [
+                column
+                for column in [
+                    "Date",
+                    "Firm",
+                    "Action",
+                    "To Grade",
+                    "From Grade",
+                    "Price target change",
+                ]
+                if column in actions_table.columns
+            ]
+
+            st.caption(
+                "Analyst actions are sourced from the available "
+                "Yahoo Finance feed; MarketWatch estimate and analyst "
+                "tables are shown below when available."
+            )
+
+            st.dataframe(
+                actions_table[keep].sort_values(
+                    "Date",
+                    ascending=False,
+                ),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        marketwatch = marketwatch_tables(symbol)
+
+        if marketwatch:
+            st.markdown(
+                "**MarketWatch EPS estimate trends and analyst tables**"
+            )
+
+            for index, table in enumerate(marketwatch):
+                text = " ".join(
+                    str(column)
+                    for column in table.columns
+                ).lower()
+
+                if any(
+                    token in text
+                    for token in [
+                        "estimate",
+                        "analyst",
+                        "consensus",
+                        "surprise",
+                    ]
+                ):
+                    st.dataframe(
+                        table,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
 
 
 if __name__ == "__main__":
